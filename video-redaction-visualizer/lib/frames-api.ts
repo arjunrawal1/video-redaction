@@ -29,8 +29,8 @@ export type DetectionBox = {
   h: number;
   text: string;
   score: number;
-  // Set by the backtracking second pass; first-pass boxes have this unset.
-  origin?: "backtrack";
+  // Set by the second/third passes; first-pass detect hits have this unset.
+  origin?: "backtrack" | "forward";
 };
 
 export type DetectionFrame = {
@@ -102,6 +102,26 @@ export type BacktrackFrameEvent = {
   box: DetectionBox;
   origin: "backtrack";
 };
+
+export type ForwardStartEvent = BacktrackStartEvent;
+
+export type ForwardFrameEvent = {
+  type: "frame";
+  index: number;
+  width: number;
+  height: number;
+  box: DetectionBox;
+  origin: "forward";
+};
+
+export type ForwardDoneEvent = BacktrackDoneEvent;
+export type ForwardErrorEvent = BacktrackErrorEvent;
+
+export type ForwardEvent =
+  | ForwardStartEvent
+  | ForwardFrameEvent
+  | ForwardDoneEvent
+  | ForwardErrorEvent;
 
 export type BacktrackDoneEvent = {
   type: "done";
@@ -258,6 +278,23 @@ export async function streamBacktrack(
   const form = buildDetectForm(file, query, opts);
   return streamNdjson<BacktrackEvent>(
     `${base}/api/ocr/backtrack`,
+    form,
+    onEvent,
+    signal,
+  );
+}
+
+export async function streamForward(
+  file: File,
+  query: string,
+  opts: StreamDetectOptions,
+  onEvent: (event: ForwardEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const base = getFramesApiBase();
+  const form = buildDetectForm(file, query, opts);
+  return streamNdjson<ForwardEvent>(
+    `${base}/api/ocr/forward`,
     form,
     onEvent,
     signal,

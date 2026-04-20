@@ -6,6 +6,7 @@ import {
   getFramesApiBase,
   streamBacktrack,
   streamDetect,
+  streamForward,
   type DeduplicatedFramesResponse,
   type DetectionFrame,
 } from "@/lib/frames-api";
@@ -19,6 +20,8 @@ type DetectionEntry = {
   // Color for backtrack boxes on this frame. Baked when the phase-2 event
   // arrives. Same philosophy as `color`.
   backtrackColor?: string;
+  // Color for forward-pass boxes. Baked when the phase-3 event arrives.
+  forwardColor?: string;
   raw?: unknown;
 };
 type DetectionMap = Record<number, DetectionEntry>;
@@ -72,7 +75,9 @@ function DetectionOverlay({
         const color =
           b.origin === "backtrack"
             ? entry.backtrackColor ?? BACKTRACK_COLOR
-            : entry.color;
+            : b.origin === "forward"
+              ? entry.forwardColor ?? BACKTRACK_COLOR
+              : entry.color;
         const boxStyle = {
           left: `${(b.x / width) * 100}%`,
           top: `${(b.y / height) * 100}%`,
@@ -293,8 +298,16 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
   // specific frames were touched by the backtrack.
   const [backtrackTouched, setBacktrackTouched] = useState<number[]>([]);
 
+  const [forwarding, setForwarding] = useState(false);
+  const [forwardStats, setForwardStats] = useState<{
+    addedFrames: number;
+    addedBoxes: number;
+  } | null>(null);
+  const [forwardTouched, setForwardTouched] = useState<number[]>([]);
+
   const detectAbortRef = useRef<AbortController | null>(null);
   const backtrackAbortRef = useRef<AbortController | null>(null);
+  const forwardAbortRef = useRef<AbortController | null>(null);
 
   const totalFrames = framesResult?.deduplicated_count ?? 0;
 
@@ -334,8 +347,12 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
     setBacktracking(false);
     setBacktrackStats(null);
     setBacktrackTouched([]);
+    setForwarding(false);
+    setForwardStats(null);
+    setForwardTouched([]);
     detectAbortRef.current?.abort();
     backtrackAbortRef.current?.abort();
+    forwardAbortRef.current?.abort();
   }, [file]);
 
   // When frames arrive (or count changes), default the range to the full span.
@@ -363,20 +380,23 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
     let matched = 0;
     let primaryBoxes = 0;
     let backtrackBoxes = 0;
+    let forwardBoxes = 0;
     let covered = 0;
     for (const entry of Object.values(detections)) {
       covered += 1;
       if (entry.detection.boxes.length > 0) matched += 1;
       for (const b of entry.detection.boxes) {
         if (b.origin === "backtrack") backtrackBoxes += 1;
+        else if (b.origin === "forward") forwardBoxes += 1;
         else primaryBoxes += 1;
       }
     }
     return {
       matched,
-      boxes: primaryBoxes + backtrackBoxes,
+      boxes: primaryBoxes + backtrackBoxes + forwardBoxes,
       primaryBoxes,
       backtrackBoxes,
+      forwardBoxes,
       covered,
     };
   }, [detections]);
@@ -392,6 +412,7 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
 
       detectAbortRef.current?.abort();
       backtrackAbortRef.current?.abort();
+      forwardAbortRef.current?.abort();
       const ac = new AbortController();
       detectAbortRef.current = ac;
       setDetecting(true);
@@ -400,12 +421,15 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
       setRunProgress({ processed: 0, total: to - from + 1, from, to });
       setBacktrackStats(null);
       setBacktrackTouched([]);
+      setForwardStats(null);
+      setForwardTouched([]);
 
       // Snapshot the pickers at run start so later changes don't retroactively
       // recolor this run's boxes (consistent with the existing per-run color
       // semantics for the first pass).
       const currentColor = firstPassColor;
       const currentBackwardColor = backwardPassColor;
+      const currentForwardColor = forwardPassColor;
       // Clear prior entries inside the range only; preserve the rest.
       setDetections((prev) => {
         const next = { ...prev };
@@ -466,6 +490,7 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
       const bac = new AbortController();
       backtrackAbortRef.current = bac;
       setBacktracking(true);
+      let phase2Ok = false;
       try {
         await streamBacktrack(
           file,
@@ -527,6 +552,7 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
           },
           bac.signal,
         );
+        phase2Ok = true;
       } catch (err) {
         if (bac.signal.aborted) return;
         setDetectError(
@@ -534,6 +560,80 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
         );
       } finally {
         if (!bac.signal.aborted) setBacktracking(false);
+      }
+
+      if (!phase2Ok || bac.signal.aborted) return;
+
+      // --- Phase 3: forward --------------------------------------------------
+      const fac = new AbortController();
+      forwardAbortRef.current = fac;
+      setForwarding(true);
+      try {
+        await streamForward(
+          file,
+          q,
+          { frameFrom: from, frameTo: to },
+          (event) => {
+            if (event.type === "frame") {
+              setDetections((prev) => {
+                const existing = prev[event.index];
+                const taggedBox = { ...event.box, origin: "forward" as const };
+                if (existing) {
+                  return {
+                    ...prev,
+                    [event.index]: {
+                      ...existing,
+                      forwardColor: currentForwardColor,
+                      detection: {
+                        ...existing.detection,
+                        boxes: existing.detection.boxes.some(
+                          (b) =>
+                            b.x === taggedBox.x &&
+                            b.y === taggedBox.y &&
+                            b.w === taggedBox.w &&
+                            b.h === taggedBox.h &&
+                            b.origin === "forward",
+                        )
+                          ? existing.detection.boxes
+                          : [...existing.detection.boxes, taggedBox],
+                      },
+                    },
+                  };
+                }
+                return {
+                  ...prev,
+                  [event.index]: {
+                    detection: {
+                      width: event.width,
+                      height: event.height,
+                      boxes: [taggedBox],
+                    },
+                    color: currentColor,
+                    forwardColor: currentForwardColor,
+                  },
+                };
+              });
+              setForwardTouched((prev) =>
+                prev.includes(event.index) ? prev : [...prev, event.index],
+              );
+            } else if (event.type === "done") {
+              setForwardStats({
+                addedFrames: event.added_frames,
+                addedBoxes: event.added_boxes,
+              });
+            } else if (event.type === "error") {
+              setDetectError(event.message);
+            }
+          },
+          fac.signal,
+        );
+      } catch (err) {
+        if (fac.signal.aborted) return;
+        setDetectError(
+          err instanceof Error ? err.message : "Forward pass failed.",
+        );
+      } finally {
+        if (!fac.signal.aborted) setForwarding(false);
       }
     },
     [
@@ -543,6 +643,7 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
       frameTo,
       firstPassColor,
       backwardPassColor,
+      forwardPassColor,
       totalFrames,
     ],
   );
@@ -550,20 +651,26 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
   const onCancel = useCallback(() => {
     detectAbortRef.current?.abort();
     backtrackAbortRef.current?.abort();
+    forwardAbortRef.current?.abort();
     setDetecting(false);
     setBacktracking(false);
+    setForwarding(false);
   }, []);
 
   const onClearDetection = useCallback(() => {
     detectAbortRef.current?.abort();
     backtrackAbortRef.current?.abort();
+    forwardAbortRef.current?.abort();
     setDetections({});
     setLastQuery("");
     setDetectError(null);
     setDetecting(false);
     setBacktracking(false);
+    setForwarding(false);
     setBacktrackStats(null);
     setBacktrackTouched([]);
+    setForwardStats(null);
+    setForwardTouched([]);
     setRunProgress(null);
   }, []);
 
@@ -658,7 +765,7 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           placeholder="Text to find and redact (e.g. an email, a name)"
-          disabled={detecting || backtracking || loading || !framesResult}
+          disabled={detecting || backtracking || forwarding || loading || !framesResult}
           className="min-w-56 flex-1 rounded-md border border-border bg-background px-3 py-1.5 text-sm text-foreground outline-none placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-sky-500 disabled:opacity-60"
         />
 
@@ -678,7 +785,7 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
               const v = Number(e.target.value);
               setFrameFrom(Number.isFinite(v) ? v : 1);
             }}
-            disabled={detecting || backtracking || loading || !framesResult}
+            disabled={detecting || backtracking || forwarding || loading || !framesResult}
             className="w-14 bg-transparent text-foreground outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
           />
           <span aria-hidden="true" className="text-muted-foreground">
@@ -698,7 +805,7 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
               const v = Number(e.target.value);
               setFrameTo(Number.isFinite(v) ? v : 1);
             }}
-            disabled={detecting || backtracking || loading || !framesResult}
+            disabled={detecting || backtracking || forwarding || loading || !framesResult}
             className="w-14 bg-transparent text-foreground outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
           />
           <span className="ml-1 text-[10px] text-muted-foreground">
@@ -707,7 +814,7 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
           <button
             type="button"
             onClick={selectFullRange}
-            disabled={detecting || backtracking || loading || !totalFrames}
+            disabled={detecting || backtracking || forwarding || loading || !totalFrames}
             className="ml-1 rounded px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-40"
             title="Set range to all frames"
           >
@@ -730,7 +837,7 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
               type="color"
               value={firstPassColor}
               onChange={(e) => setFirstPassColor(e.target.value)}
-              disabled={detecting || backtracking}
+              disabled={detecting || backtracking || forwarding}
               className="h-5 w-6 cursor-pointer appearance-none rounded border border-border bg-transparent p-0 disabled:opacity-50"
             />
           </label>
@@ -745,14 +852,14 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
               type="color"
               value={backwardPassColor}
               onChange={(e) => setBackwardPassColor(e.target.value)}
-              disabled={detecting || backtracking}
+              disabled={detecting || backtracking || forwarding}
               className="h-5 w-6 cursor-pointer appearance-none rounded border border-border bg-transparent p-0 disabled:opacity-50"
             />
           </label>
           <label
             htmlFor={forwardColorInputId}
-            className="flex items-center gap-1 opacity-60"
-            title="Forward pass (not yet implemented)"
+            className="flex items-center gap-1"
+            title="Forward pass (retro-fill partials into later frames)"
           >
             <span>Fwd</span>
             <input
@@ -760,13 +867,13 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
               type="color"
               value={forwardPassColor}
               onChange={(e) => setForwardPassColor(e.target.value)}
-              disabled={detecting || backtracking}
+              disabled={detecting || backtracking || forwarding}
               className="h-5 w-6 cursor-pointer appearance-none rounded border border-border bg-transparent p-0 disabled:opacity-50"
             />
           </label>
         </div>
 
-        {detecting || backtracking ? (
+        {detecting || backtracking || forwarding ? (
           <button
             type="button"
             onClick={onCancel}
@@ -784,7 +891,7 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
           </button>
         )}
 
-        {stats.covered > 0 && !detecting && !backtracking && (
+        {stats.covered > 0 && !detecting && !backtracking && !forwarding && (
           <button
             type="button"
             onClick={onClearDetection}
@@ -818,6 +925,15 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
               </span>
             </>
           )}
+          {stats.forwardBoxes > 0 && (
+            <>
+              {" "}
+              ·{" "}
+              <span style={{ color: forwardPassColor }}>
+                {stats.forwardBoxes} forwarded
+              </span>
+            </>
+          )}
           {stats.covered < totalFrames && (
             <>
               {" "}
@@ -842,7 +958,13 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
         </p>
       )}
 
-      {!detecting && !backtracking && backtrackStats && (
+      {forwarding && !detecting && !backtracking && (
+        <p className="text-xs text-muted-foreground" aria-live="polite">
+          Forwarding partials into later frames…
+        </p>
+      )}
+
+      {!detecting && !backtracking && !forwarding && backtrackStats && (
         <p className="text-[11px] text-muted-foreground">
           <span style={{ color: backwardPassColor }}>Backtrack</span> added{" "}
           {backtrackStats.addedBoxes} box
@@ -860,6 +982,36 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
                     <span
                       className="font-mono text-foreground"
                       style={{ color: backwardPassColor }}
+                    >
+                      #{n}
+                    </span>
+                    {i < arr.length - 1 ? ", " : ""}
+                  </span>
+                ))}
+            </>
+          )}
+          .
+        </p>
+      )}
+
+      {!detecting && !backtracking && !forwarding && forwardStats && (
+        <p className="text-[11px] text-muted-foreground">
+          <span style={{ color: forwardPassColor }}>Forward</span> added{" "}
+          {forwardStats.addedBoxes} box
+          {forwardStats.addedBoxes === 1 ? "" : "es"} across{" "}
+          {forwardStats.addedFrames} frame
+          {forwardStats.addedFrames === 1 ? "" : "s"}
+          {forwardTouched.length > 0 && (
+            <>
+              {": "}
+              {forwardTouched
+                .slice()
+                .sort((a, b) => a - b)
+                .map((n, i, arr) => (
+                  <span key={`fw-${n}`}>
+                    <span
+                      className="font-mono text-foreground"
+                      style={{ color: forwardPassColor }}
                     >
                       #{n}
                     </span>
@@ -931,13 +1083,19 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
                   </span>
                   {entry?.detection.boxes.length ? (() => {
                     const primary = entry.detection.boxes.filter(
-                      (b) => b.origin !== "backtrack",
+                      (b) => b.origin == null,
                     ).length;
-                    const back = entry.detection.boxes.length - primary;
+                    const back = entry.detection.boxes.filter(
+                      (b) => b.origin === "backtrack",
+                    ).length;
+                    // Pick the badge color from whichever origin has any
+                    // representation on this frame, preferring primary.
                     const badgeBg =
                       primary > 0
                         ? entry.color
-                        : entry.backtrackColor ?? BACKTRACK_COLOR;
+                        : back > 0
+                          ? entry.backtrackColor ?? BACKTRACK_COLOR
+                          : entry.forwardColor ?? BACKTRACK_COLOR;
                     // Letter list, deduped and in first-encountered order.
                     const uniqueLabels: string[] = [];
                     if (labelsForFrame) {

@@ -384,3 +384,56 @@ def run_backtrack(entry: OcrEntry) -> list[AddedHit]:
             )
 
     return added
+
+
+def run_forward(entry: OcrEntry) -> list[AddedHit]:
+    """Mirror of `run_backtrack` in the forward direction.
+
+    Walk frames bottom-up. For each hit `P` in frame `idx`, ask whether any
+    hit in frame `idx+1` is plausibly the same text (same correspondence
+    predicate as backtrack). If not, `P` has "retired" -- the hit went away
+    but the text may still be partially present in `idx+1`. Scan `idx+1`'s
+    raw Textract response near `P`'s region for a partial of the query and
+    append it in-place. Because we mutate `next_frame.matched` while still
+    within the loop, the next iteration (which treats `idx+1` as "current")
+    sees the newly-added hit and can itself forward into `idx+2`, giving us
+    recursive forward propagation through iteration.
+
+    Used for the "text is gradually deleted / fades off screen" case that's
+    the mirror of the "text is gradually typed in" case that backtrack
+    solves. Core helpers (`_has_correspondence`, `_find_partial`,
+    `_box_overlaps_existing`) are all temporally neutral, so we reuse them
+    verbatim with source/target frames swapped.
+    """
+    added: list[AddedHit] = []
+    lo = entry.frame_from
+    hi = entry.frame_to
+
+    for idx in range(lo, hi):
+        current = entry.per_frame.get(idx)
+        nxt = entry.per_frame.get(idx + 1)
+        if current is None or nxt is None:
+            continue
+        # Snapshot: don't re-scan a box we added in this iteration.
+        current_hits = list(current.matched)
+        for hit in current_hits:
+            # Same predicate, different frame pair: has any hit in the NEXT
+            # frame plausibly inherited this text?
+            if _has_correspondence(hit, current, nxt):
+                continue
+            partial = _find_partial(hit, current, nxt, entry.query_norm)
+            if partial is None:
+                continue
+            if _box_overlaps_existing(partial, nxt.matched):
+                continue
+            nxt.matched.append(partial)
+            added.append(AddedHit(frame_idx_1=idx + 1, box=partial))
+            log.info(
+                "forward: frame #%d -> #%d text=%r conf=%.2f",
+                idx,
+                idx + 1,
+                partial.text,
+                partial.score,
+            )
+
+    return added

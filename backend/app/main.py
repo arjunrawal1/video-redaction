@@ -465,28 +465,25 @@ async def _populate_phase1_for_backtrack(
     return entry
 
 
-@app.post("/api/ocr/backtrack")
-async def backtrack_stream(
-    file: UploadFile = File(...),
-    query: str = Form(..., min_length=1, max_length=200),
-    frame_from: int = Form(1, ge=1),
-    frame_to: int | None = Form(None),
-    fps: float | None = Form(None),
-    dedup_threshold: int = Form(4),
+async def _run_pass_stream(
+    *,
+    file: UploadFile,
+    query: str,
+    frame_from: int,
+    frame_to: int | None,
+    fps: float | None,
+    dedup_threshold: int,
+    pass_name: str,
+    origin: str,
+    driver,
 ) -> StreamingResponse:
-    """Stream backtracked OCR hits as NDJSON.
+    """Shared endpoint body for backward/forward passes.
 
-    Walks frames in reverse and, for each genuinely new hit (no
-    corresponding hit in the previous frame), looks for a partial of the
-    query near the same region in frame n-1. Iteratively recurses backward.
-
-    Events:
-      {"type":"start", "video_hash", "query", "frame_from", "frame_to",
-       "total_frames"}
-      {"type":"frame", "index": i, "width":..., "height":...,
-       "box": {x,y,w,h,text,score}, "origin": "backtrack"}
-      {"type":"done", "added_frames": k, "added_boxes": b}
-      {"type":"error", "message": "..."}
+    Handles all request validation, frame extraction, OCR-cache hit-or-
+    populate, then hands off to `driver(entry)` (a sync callable returning
+    `list[AddedHit]`) via a worker thread and streams the results as
+    NDJSON. `origin` is stamped onto every emitted frame event so the
+    client can visually distinguish pass sources.
     """
     _validate_video(file)
     t_req = time.perf_counter()
@@ -499,8 +496,9 @@ async def backtrack_stream(
         fps = None
 
     log.info(
-        "backtrack: recv file=%r bytes=%d query=%r range=%s..%s "
+        "%s: recv file=%r bytes=%d query=%r range=%s..%s "
         "fps=%s dedup_threshold=%d",
+        pass_name,
         file.filename,
         len(body),
         query,
@@ -564,8 +562,9 @@ async def backtrack_stream(
         )
         if entry is None:
             log.info(
-                "backtrack: no cached phase-1 for query=%r range=%d..%d; "
+                "%s: no cached phase-1 for query=%r range=%d..%d; "
                 "running inline",
+                pass_name,
                 q_norm,
                 lo_1,
                 hi_1,
@@ -581,34 +580,34 @@ async def backtrack_stream(
                     hi_1=hi_1,
                 )
             except Exception as e:  # pragma: no cover
-                log.exception("backtrack: inline phase-1 failed")
+                log.exception("%s: inline phase-1 failed", pass_name)
                 yield _ndjson(
                     {"type": "error", "message": f"phase-1 failed: {e}"}
                 )
                 return
 
-        # Run the backtrack driver on a worker thread so we don't block the
+        # Run the pass driver on a worker thread so we don't block the
         # event loop while we crunch through (potentially large) raw
         # Textract payloads.
-        t_back = time.perf_counter()
+        t_drv = time.perf_counter()
         try:
-            added = await asyncio.to_thread(ocr_backtrack.run_backtrack, entry)
+            added = await asyncio.to_thread(driver, entry)
         except Exception as e:  # pragma: no cover
-            log.exception("backtrack: driver failed")
+            log.exception("%s: driver failed", pass_name)
             yield _ndjson({"type": "error", "message": str(e)})
             return
-        back_ms = (time.perf_counter() - t_back) * 1000
+        drv_ms = (time.perf_counter() - t_drv) * 1000
 
         frames_touched: set[int] = set()
         for hit in added:
             frames_touched.add(hit.frame_idx_1)
-            prev = entry.per_frame.get(hit.frame_idx_1)
+            fr = entry.per_frame.get(hit.frame_idx_1)
             yield _ndjson(
                 {
                     "type": "frame",
                     "index": hit.frame_idx_1,
-                    "width": prev.width if prev else 0,
-                    "height": prev.height if prev else 0,
+                    "width": fr.width if fr else 0,
+                    "height": fr.height if fr else 0,
                     "box": {
                         "x": hit.box.x,
                         "y": hit.box.y,
@@ -617,17 +616,18 @@ async def backtrack_stream(
                         "text": hit.box.text,
                         "score": round(hit.box.score, 3),
                     },
-                    "origin": "backtrack",
+                    "origin": origin,
                 }
             )
 
         total_req = time.perf_counter() - t_req
         log.info(
-            "backtrack: done added_frames=%d added_boxes=%d "
+            "%s: done added_frames=%d added_boxes=%d "
             "driver=%.0fms req_wall=%.1fs",
+            pass_name,
             len(frames_touched),
             len(added),
-            back_ms,
+            drv_ms,
             total_req,
         )
         yield _ndjson(
@@ -645,4 +645,62 @@ async def backtrack_stream(
             "Cache-Control": "no-cache, no-transform",
             "X-Accel-Buffering": "no",
         },
+    )
+
+
+@app.post("/api/ocr/backtrack")
+async def backtrack_stream(
+    file: UploadFile = File(...),
+    query: str = Form(..., min_length=1, max_length=200),
+    frame_from: int = Form(1, ge=1),
+    frame_to: int | None = Form(None),
+    fps: float | None = Form(None),
+    dedup_threshold: int = Form(4),
+) -> StreamingResponse:
+    """Stream backward-pass hits as NDJSON.
+
+    Walks frames in reverse and, for each genuinely new hit (no
+    corresponding hit in the previous frame), looks for a partial of the
+    query near the same region in frame n-1. Iteratively walks back.
+    """
+    return await _run_pass_stream(
+        file=file,
+        query=query,
+        frame_from=frame_from,
+        frame_to=frame_to,
+        fps=fps,
+        dedup_threshold=dedup_threshold,
+        pass_name="backtrack",
+        origin="backtrack",
+        driver=ocr_backtrack.run_backtrack,
+    )
+
+
+@app.post("/api/ocr/forward")
+async def forward_stream(
+    file: UploadFile = File(...),
+    query: str = Form(..., min_length=1, max_length=200),
+    frame_from: int = Form(1, ge=1),
+    frame_to: int | None = Form(None),
+    fps: float | None = Form(None),
+    dedup_threshold: int = Form(4),
+) -> StreamingResponse:
+    """Stream forward-pass hits as NDJSON.
+
+    Walks frames in order and, for each hit that has retired (no
+    corresponding hit in the next frame), looks for a partial of the query
+    near the same region in frame n+1. Iteratively walks forward. The
+    mirror of /api/ocr/backtrack; typically called after it so it sees any
+    backward-added anchors.
+    """
+    return await _run_pass_stream(
+        file=file,
+        query=query,
+        frame_from=frame_from,
+        frame_to=frame_to,
+        fps=fps,
+        dedup_threshold=dedup_threshold,
+        pass_name="forward",
+        origin="forward",
+        driver=ocr_backtrack.run_forward,
     )
