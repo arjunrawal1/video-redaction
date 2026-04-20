@@ -14,11 +14,73 @@ export type DeduplicatedFrame = {
 
 export type DeduplicatedFramesResponse = {
   filename: string | null;
+  video_hash?: string;
   fps: number | null;
   dedup_threshold: number;
   raw_frame_count: number;
   deduplicated_count: number;
   frames: DeduplicatedFrame[];
+};
+
+export type DetectionBox = {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  text: string;
+  score: number;
+};
+
+export type DetectionFrame = {
+  width: number;
+  height: number;
+  boxes: DetectionBox[];
+};
+
+export type DetectStartEvent = {
+  type: "start";
+  video_hash: string;
+  query: string;
+  deduplicated_count: number;
+  frame_from: number;
+  frame_to: number;
+  frame_indices: number[];
+  total: number;
+};
+
+export type DetectFrameEvent = {
+  type: "frame";
+  index: number;
+  width: number;
+  height: number;
+  boxes: DetectionBox[];
+  // Full Textract DetectDocumentText response for this frame, included
+  // verbatim so the UI can surface it via a "Copy OCR debug" button.
+  raw?: unknown;
+};
+
+export type DetectDoneEvent = {
+  type: "done";
+  matched_frames: number;
+  total_boxes: number;
+};
+
+export type DetectErrorEvent = {
+  type: "error";
+  message: string;
+};
+
+export type DetectEvent =
+  | DetectStartEvent
+  | DetectFrameEvent
+  | DetectDoneEvent
+  | DetectErrorEvent;
+
+export type StreamDetectOptions = {
+  frameFrom?: number;
+  frameTo?: number;
+  fps?: number;
+  dedupThreshold?: number;
 };
 
 function parseErrorBody(text: string): string {
@@ -57,4 +119,75 @@ export async function fetchDeduplicatedFrames(
     throw new Error(parseErrorBody(text) || `HTTP ${res.status}`);
   }
   return JSON.parse(text) as DeduplicatedFramesResponse;
+}
+
+export async function streamDetect(
+  file: File,
+  query: string,
+  opts: StreamDetectOptions,
+  onEvent: (event: DetectEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const base = getFramesApiBase();
+  const form = new FormData();
+  form.append("file", file);
+  form.append("query", query);
+  if (opts.frameFrom != null) form.append("frame_from", String(opts.frameFrom));
+  if (opts.frameTo != null) form.append("frame_to", String(opts.frameTo));
+  if (opts.fps != null) form.append("fps", String(opts.fps));
+  if (opts.dedupThreshold != null) {
+    form.append("dedup_threshold", String(opts.dedupThreshold));
+  }
+
+  const res = await fetch(`${base}/api/ocr/detect/stream`, {
+    method: "POST",
+    body: form,
+    signal,
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(parseErrorBody(text) || `HTTP ${res.status}`);
+  }
+  if (!res.body) {
+    throw new Error("Streaming not supported by this browser.");
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+
+  const flushLine = (line: string) => {
+    const trimmed = line.trim();
+    if (!trimmed) return;
+    let parsed: DetectEvent;
+    try {
+      parsed = JSON.parse(trimmed) as DetectEvent;
+    } catch {
+      return;
+    }
+    onEvent(parsed);
+  };
+
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let nl = buf.indexOf("\n");
+      while (nl !== -1) {
+        const line = buf.slice(0, nl);
+        buf = buf.slice(nl + 1);
+        flushLine(line);
+        nl = buf.indexOf("\n");
+      }
+    }
+    buf += decoder.decode();
+    if (buf.length > 0) flushLine(buf);
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {
+      /* ignore */
+    }
+  }
 }

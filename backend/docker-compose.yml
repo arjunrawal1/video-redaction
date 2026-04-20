@@ -15,3 +15,15 @@ services:
       - --reload
     environment:
       - PYTHONUNBUFFERED=1
+      # INFO shows per-frame summaries; DEBUG adds per-word OCR timings.
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      # AWS creds for Textract. Drop these into a local .env file (git-ignored)
+      # or export in your shell before `docker compose up`.
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+      - AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN:-}
+      # OCR tunables (see ocr_service.py for the full list).
+      - OCR_CONCURRENCY=${OCR_CONCURRENCY:-8}
+      - OCR_MIN_CONFIDENCE=${OCR_MIN_CONFIDENCE:-10}
+      - OCR_FUZZY_THRESHOLD=${OCR_FUZZY_THRESHOLD:-0.82}
