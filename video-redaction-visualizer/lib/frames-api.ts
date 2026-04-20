@@ -31,6 +31,10 @@ export type DetectionBox = {
   score: number;
   // Set by the second/third passes; first-pass detect hits have this unset.
   origin?: "backtrack" | "forward";
+  // Excel-style cross-frame identity label. Populated by engines that
+  // produce labels server-side (Gemini). OCR leaves this undefined and the
+  // client falls back to the deterministic assignLabels pass.
+  label?: string;
 };
 
 export type DetectionFrame = {
@@ -83,6 +87,9 @@ export type StreamDetectOptions = {
   frameTo?: number;
   fps?: number;
   dedupThreshold?: number;
+  // "ocr"   → Python backend /api/ocr/*    (default)
+  // "gemini"→ Next.js route   /api/gemini/* (same-origin, Vercel AI SDK)
+  engine?: "ocr" | "gemini";
 };
 
 export type BacktrackStartEvent = {
@@ -250,6 +257,16 @@ function buildDetectForm(
   return form;
 }
 
+type PassName = "detect/stream" | "backtrack" | "forward";
+
+function passUrl(pass: PassName, engine: "ocr" | "gemini" | undefined): string {
+  if (engine === "gemini") {
+    // Same-origin Next.js route handler.
+    return `/api/gemini/${pass}`;
+  }
+  return `${getFramesApiBase()}/api/ocr/${pass}`;
+}
+
 export async function streamDetect(
   file: File,
   query: string,
@@ -257,10 +274,9 @@ export async function streamDetect(
   onEvent: (event: DetectEvent) => void,
   signal?: AbortSignal,
 ): Promise<void> {
-  const base = getFramesApiBase();
   const form = buildDetectForm(file, query, opts);
   return streamNdjson<DetectEvent>(
-    `${base}/api/ocr/detect/stream`,
+    passUrl("detect/stream", opts.engine),
     form,
     onEvent,
     signal,
@@ -274,10 +290,9 @@ export async function streamBacktrack(
   onEvent: (event: BacktrackEvent) => void,
   signal?: AbortSignal,
 ): Promise<void> {
-  const base = getFramesApiBase();
   const form = buildDetectForm(file, query, opts);
   return streamNdjson<BacktrackEvent>(
-    `${base}/api/ocr/backtrack`,
+    passUrl("backtrack", opts.engine),
     form,
     onEvent,
     signal,
@@ -291,10 +306,9 @@ export async function streamForward(
   onEvent: (event: ForwardEvent) => void,
   signal?: AbortSignal,
 ): Promise<void> {
-  const base = getFramesApiBase();
   const form = buildDetectForm(file, query, opts);
   return streamNdjson<ForwardEvent>(
-    `${base}/api/ocr/forward`,
+    passUrl("forward", opts.engine),
     form,
     onEvent,
     signal,

@@ -86,7 +86,9 @@ function DetectionOverlay({
           borderColor: color,
           boxShadow: `0 0 0 1px rgba(0,0,0,0.4)`,
         } as const;
-        const label = labels?.[i];
+        // Prefer a per-box label coming from the server (Gemini path).
+        // Fall back to the client-side assignLabels result for OCR.
+        const label = b.label ?? labels?.[i];
         return (
           <div key={`b-${i}`}>
             <div
@@ -263,6 +265,9 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
   const [query, setQuery] = useState("");
   const [frameFrom, setFrameFrom] = useState<number>(1);
   const [frameTo, setFrameTo] = useState<number>(1);
+  // "ocr" calls the Python backend (Textract). "gemini" calls the Next.js
+  // route handlers (OpenRouter + Vercel AI SDK).
+  const [engine, setEngine] = useState<"ocr" | "gemini">("ocr");
   const [firstPassColor, setFirstPassColor] = useState<string>(
     DEFAULT_FIRST_PASS_COLOR,
   );
@@ -424,12 +429,13 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
       setForwardStats(null);
       setForwardTouched([]);
 
-      // Snapshot the pickers at run start so later changes don't retroactively
-      // recolor this run's boxes (consistent with the existing per-run color
-      // semantics for the first pass).
+      // Snapshot the pickers + engine at run start so later changes don't
+      // retroactively recolor this run's boxes (consistent with the existing
+      // per-run color semantics for the first pass).
       const currentColor = firstPassColor;
       const currentBackwardColor = backwardPassColor;
       const currentForwardColor = forwardPassColor;
+      const currentEngine = engine;
       // Clear prior entries inside the range only; preserve the rest.
       setDetections((prev) => {
         const next = { ...prev };
@@ -443,7 +449,7 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
         await streamDetect(
           file,
           q,
-          { frameFrom: from, frameTo: to },
+          { frameFrom: from, frameTo: to, engine: currentEngine },
           (event) => {
             if (event.type === "start") {
               setRunProgress({
@@ -495,7 +501,7 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
         await streamBacktrack(
           file,
           q,
-          { frameFrom: from, frameTo: to },
+          { frameFrom: from, frameTo: to, engine: currentEngine },
           (event) => {
             if (event.type === "frame") {
               setDetections((prev) => {
@@ -572,7 +578,7 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
         await streamForward(
           file,
           q,
-          { frameFrom: from, frameTo: to },
+          { frameFrom: from, frameTo: to, engine: currentEngine },
           (event) => {
             if (event.type === "frame") {
               setDetections((prev) => {
@@ -644,6 +650,7 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
       firstPassColor,
       backwardPassColor,
       forwardPassColor,
+      engine,
       totalFrames,
     ],
   );
@@ -873,6 +880,38 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
           </label>
         </div>
 
+        <div
+          role="group"
+          aria-label="Detection engine"
+          className="inline-flex overflow-hidden rounded-md border border-border text-xs"
+        >
+          {(["ocr", "gemini"] as const).map((k) => {
+            const active = engine === k;
+            return (
+              <button
+                key={k}
+                type="button"
+                onClick={() => setEngine(k)}
+                aria-pressed={active}
+                disabled={detecting || backtracking || forwarding}
+                title={
+                  k === "ocr"
+                    ? "Textract OCR via Python backend"
+                    : "OpenRouter (Gemini 2.5 Flash) via Vercel AI SDK"
+                }
+                className={[
+                  "px-2 py-1 font-medium transition-colors disabled:opacity-50",
+                  active
+                    ? "bg-foreground text-background"
+                    : "bg-background text-muted-foreground hover:bg-muted hover:text-foreground",
+                ].join(" ")}
+              >
+                {k === "ocr" ? "OCR" : "Gemini"}
+              </button>
+            );
+          })}
+        </div>
+
         {detecting || backtracking || forwarding ? (
           <button
             type="button"
@@ -1097,10 +1136,15 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
                           ? entry.backtrackColor ?? BACKTRACK_COLOR
                           : entry.forwardColor ?? BACKTRACK_COLOR;
                     // Letter list, deduped and in first-encountered order.
+                    // Prefer per-box label (Gemini); fall back to the
+                    // client-side assignLabels result (OCR).
                     const uniqueLabels: string[] = [];
-                    if (labelsForFrame) {
-                      for (const l of labelsForFrame) {
-                        if (!uniqueLabels.includes(l)) uniqueLabels.push(l);
+                    for (let i = 0; i < entry.detection.boxes.length; i++) {
+                      const boxLabel =
+                        entry.detection.boxes[i].label ??
+                        labelsForFrame?.[i];
+                      if (boxLabel && !uniqueLabels.includes(boxLabel)) {
+                        uniqueLabels.push(boxLabel);
                       }
                     }
                     const letterLabel =

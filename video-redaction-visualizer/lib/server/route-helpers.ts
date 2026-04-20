@@ -1,0 +1,97 @@
+// Shared helpers for the three Gemini route handlers.
+
+export type FormInputs = {
+  file: File;
+  query: string;
+  frameFrom: number;
+  frameTo: number | null;
+  fps: number | null;
+  dedupThreshold: number;
+};
+
+export async function readFormInputs(
+  req: Request,
+): Promise<FormInputs | { error: string }> {
+  let form: FormData;
+  try {
+    form = await req.formData();
+  } catch {
+    return { error: "Expected multipart/form-data." };
+  }
+  const file = form.get("file");
+  if (!(file instanceof File)) return { error: "Missing file upload." };
+  const query = String(form.get("query") ?? "").trim();
+  if (!query) return { error: "Missing query." };
+  const frameFromRaw = form.get("frame_from");
+  const frameToRaw = form.get("frame_to");
+  const fpsRaw = form.get("fps");
+  const dedupRaw = form.get("dedup_threshold");
+
+  const asNum = (v: FormDataEntryValue | null): number | null => {
+    if (v == null) return null;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  };
+
+  const frameFrom = Math.max(1, Math.floor(asNum(frameFromRaw) ?? 1));
+  const frameTo = asNum(frameToRaw) == null ? null : Math.floor(asNum(frameToRaw)!);
+  const fps = asNum(fpsRaw) == null ? null : (asNum(fpsRaw) as number);
+  const dedupThreshold = Math.floor(asNum(dedupRaw) ?? 4);
+
+  return { file, query, frameFrom, frameTo, fps, dedupThreshold };
+}
+
+export function normalizeQuery(q: string): string {
+  return q.toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+export function ndjsonLine(obj: unknown): string {
+  return JSON.stringify(obj) + "\n";
+}
+
+const NDJSON_HEADERS = {
+  "Content-Type": "application/x-ndjson",
+  "Cache-Control": "no-cache, no-transform",
+  "X-Accel-Buffering": "no",
+};
+
+/**
+ * Wrap an async generator that yields NDJSON strings into a Response with the
+ * right headers. Abort signal: when the client disconnects, Node will cancel
+ * the stream and we swallow the resulting AbortError.
+ */
+export function ndjsonStreamResponse(
+  produce: (ctrl: {
+    emit: (obj: unknown) => void;
+    error: (message: string) => void;
+    done: () => void;
+  }) => Promise<void>,
+): Response {
+  const stream = new ReadableStream({
+    async start(ctrl) {
+      const enc = new TextEncoder();
+      const emit = (obj: unknown) => {
+        try {
+          ctrl.enqueue(enc.encode(ndjsonLine(obj)));
+        } catch {
+          /* client disconnected */
+        }
+      };
+      const errorOnce = (message: string) => {
+        emit({ type: "error", message });
+      };
+      try {
+        await produce({ emit, error: errorOnce, done: () => {} });
+      } catch (e) {
+        errorOnce(e instanceof Error ? e.message : String(e));
+      } finally {
+        try {
+          ctrl.close();
+        } catch {
+          /* already closed */
+        }
+      }
+    },
+  });
+  return new Response(stream, { headers: NDJSON_HEADERS });
+}
