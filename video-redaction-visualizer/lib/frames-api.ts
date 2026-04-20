@@ -29,6 +29,8 @@ export type DetectionBox = {
   h: number;
   text: string;
   score: number;
+  // Set by the backtracking second pass; first-pass boxes have this unset.
+  origin?: "backtrack";
 };
 
 export type DetectionFrame = {
@@ -83,6 +85,41 @@ export type StreamDetectOptions = {
   dedupThreshold?: number;
 };
 
+export type BacktrackStartEvent = {
+  type: "start";
+  video_hash: string;
+  query: string;
+  frame_from: number;
+  frame_to: number;
+  total_frames: number;
+};
+
+export type BacktrackFrameEvent = {
+  type: "frame";
+  index: number;
+  width: number;
+  height: number;
+  box: DetectionBox;
+  origin: "backtrack";
+};
+
+export type BacktrackDoneEvent = {
+  type: "done";
+  added_frames: number;
+  added_boxes: number;
+};
+
+export type BacktrackErrorEvent = {
+  type: "error";
+  message: string;
+};
+
+export type BacktrackEvent =
+  | BacktrackStartEvent
+  | BacktrackFrameEvent
+  | BacktrackDoneEvent
+  | BacktrackErrorEvent;
+
 function parseErrorBody(text: string): string {
   try {
     const j = JSON.parse(text) as { detail?: unknown };
@@ -121,29 +158,13 @@ export async function fetchDeduplicatedFrames(
   return JSON.parse(text) as DeduplicatedFramesResponse;
 }
 
-export async function streamDetect(
-  file: File,
-  query: string,
-  opts: StreamDetectOptions,
-  onEvent: (event: DetectEvent) => void,
+async function streamNdjson<E>(
+  url: string,
+  form: FormData,
+  onEvent: (event: E) => void,
   signal?: AbortSignal,
 ): Promise<void> {
-  const base = getFramesApiBase();
-  const form = new FormData();
-  form.append("file", file);
-  form.append("query", query);
-  if (opts.frameFrom != null) form.append("frame_from", String(opts.frameFrom));
-  if (opts.frameTo != null) form.append("frame_to", String(opts.frameTo));
-  if (opts.fps != null) form.append("fps", String(opts.fps));
-  if (opts.dedupThreshold != null) {
-    form.append("dedup_threshold", String(opts.dedupThreshold));
-  }
-
-  const res = await fetch(`${base}/api/ocr/detect/stream`, {
-    method: "POST",
-    body: form,
-    signal,
-  });
+  const res = await fetch(url, { method: "POST", body: form, signal });
   if (!res.ok) {
     const text = await res.text().catch(() => "");
     throw new Error(parseErrorBody(text) || `HTTP ${res.status}`);
@@ -159,9 +180,9 @@ export async function streamDetect(
   const flushLine = (line: string) => {
     const trimmed = line.trim();
     if (!trimmed) return;
-    let parsed: DetectEvent;
+    let parsed: E;
     try {
-      parsed = JSON.parse(trimmed) as DetectEvent;
+      parsed = JSON.parse(trimmed) as E;
     } catch {
       return;
     }
@@ -190,4 +211,55 @@ export async function streamDetect(
       /* ignore */
     }
   }
+}
+
+function buildDetectForm(
+  file: File,
+  query: string,
+  opts: StreamDetectOptions,
+): FormData {
+  const form = new FormData();
+  form.append("file", file);
+  form.append("query", query);
+  if (opts.frameFrom != null) form.append("frame_from", String(opts.frameFrom));
+  if (opts.frameTo != null) form.append("frame_to", String(opts.frameTo));
+  if (opts.fps != null) form.append("fps", String(opts.fps));
+  if (opts.dedupThreshold != null) {
+    form.append("dedup_threshold", String(opts.dedupThreshold));
+  }
+  return form;
+}
+
+export async function streamDetect(
+  file: File,
+  query: string,
+  opts: StreamDetectOptions,
+  onEvent: (event: DetectEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const base = getFramesApiBase();
+  const form = buildDetectForm(file, query, opts);
+  return streamNdjson<DetectEvent>(
+    `${base}/api/ocr/detect/stream`,
+    form,
+    onEvent,
+    signal,
+  );
+}
+
+export async function streamBacktrack(
+  file: File,
+  query: string,
+  opts: StreamDetectOptions,
+  onEvent: (event: BacktrackEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const base = getFramesApiBase();
+  const form = buildDetectForm(file, query, opts);
+  return streamNdjson<BacktrackEvent>(
+    `${base}/api/ocr/backtrack`,
+    form,
+    onEvent,
+    signal,
+  );
 }

@@ -8,6 +8,8 @@
   --border: #e4e4e7;
   --destructive: #dc2626;
   --destructive-foreground: #ffffff;
+  --backtrack: #f59e0b;
+  --backtrack-foreground: #1c1917;
 }
 
 @theme inline {
@@ -18,6 +20,8 @@
   --color-border: var(--border);
   --color-destructive: var(--destructive);
   --color-destructive-foreground: var(--destructive-foreground);
+  --color-backtrack: var(--backtrack);
+  --color-backtrack-foreground: var(--backtrack-foreground);
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
 }
@@ -31,6 +35,8 @@
     --border: #27272a;
     --destructive: #ef4444;
     --destructive-foreground: #0a0a0a;
+    --backtrack: #fbbf24;
+    --backtrack-foreground: #1c1917;
   }
 }
 

@@ -4,19 +4,30 @@ import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react"
 import {
   fetchDeduplicatedFrames,
   getFramesApiBase,
+  streamBacktrack,
   streamDetect,
   type DeduplicatedFramesResponse,
   type DetectionFrame,
 } from "@/lib/frames-api";
+import { assignLabels, type FrameLabelMap } from "@/lib/labeling";
 
 type DetectionEntry = {
   detection: DetectionFrame;
+  // Color for first-pass boxes on this frame. Baked when the phase-1 event
+  // arrives so later picker changes don't retroactively recolor old runs.
   color: string;
+  // Color for backtrack boxes on this frame. Baked when the phase-2 event
+  // arrives. Same philosophy as `color`.
+  backtrackColor?: string;
   raw?: unknown;
 };
 type DetectionMap = Record<number, DetectionEntry>;
 
-const DEFAULT_BOX_COLOR = "#dc2626";
+const DEFAULT_FIRST_PASS_COLOR = "#dc2626";
+const DEFAULT_BACKWARD_PASS_COLOR = "#f59e0b";
+const DEFAULT_FORWARD_PASS_COLOR = "#3b82f6";
+// Fallback if somehow no baked color is present; matches the globals.css var.
+const BACKTRACK_COLOR = "var(--backtrack)";
 import {
   clearUploadedVideo,
   loadUploadedVideo,
@@ -36,9 +47,11 @@ function formatBytes(n: number): string {
 
 function DetectionOverlay({
   entry,
+  labels,
   className,
 }: {
   entry: DetectionEntry | undefined;
+  labels?: string[];
   className?: string;
 }) {
   if (
@@ -50,14 +63,17 @@ function DetectionOverlay({
     return null;
   }
   const { width, height, boxes } = entry.detection;
-  const color = entry.color;
   return (
     <div
       aria-hidden="true"
       className={["pointer-events-none absolute inset-0", className ?? ""].join(" ")}
     >
       {boxes.map((b, i) => {
-        const style = {
+        const color =
+          b.origin === "backtrack"
+            ? entry.backtrackColor ?? BACKTRACK_COLOR
+            : entry.color;
+        const boxStyle = {
           left: `${(b.x / width) * 100}%`,
           top: `${(b.y / height) * 100}%`,
           width: `${(b.w / width) * 100}%`,
@@ -65,12 +81,26 @@ function DetectionOverlay({
           borderColor: color,
           boxShadow: `0 0 0 1px rgba(0,0,0,0.4)`,
         } as const;
+        const label = labels?.[i];
         return (
-          <div
-            key={`b-${i}`}
-            className="absolute rounded-[2px] border-2"
-            style={style}
-          />
+          <div key={`b-${i}`}>
+            <div
+              className="absolute rounded-[2px] border-2"
+              style={boxStyle}
+            />
+            {label && (
+              <span
+                className="absolute -translate-y-full rounded px-1 py-px font-mono text-[10px] font-semibold leading-none text-white shadow-sm"
+                style={{
+                  left: `${(b.x / width) * 100}%`,
+                  top: `${(b.y / height) * 100}%`,
+                  backgroundColor: color,
+                }}
+              >
+                {label}
+              </span>
+            )}
+          </div>
         );
       })}
     </div>
@@ -80,6 +110,7 @@ function DetectionOverlay({
 function FrameLightbox({
   frames,
   detections,
+  frameLabels,
   index,
   onClose,
   onNavigate,
@@ -88,6 +119,7 @@ function FrameLightbox({
 }: {
   frames: DeduplicatedFramesResponse["frames"];
   detections: DetectionMap;
+  frameLabels: FrameLabelMap;
   index: number;
   onClose: () => void;
   onNavigate: (next: number) => void;
@@ -199,7 +231,10 @@ function FrameLightbox({
           alt={`Frame ${index + 1}`}
           className="block max-h-[90vh] max-w-[95vw]"
         />
-        <DetectionOverlay entry={detections[index + 1]} />
+        <DetectionOverlay
+          entry={detections[index + 1]}
+          labels={frameLabels[index + 1]}
+        />
       </div>
     </div>
   );
@@ -209,7 +244,9 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
   const queryInputId = useId();
   const fromInputId = useId();
   const toInputId = useId();
-  const colorInputId = useId();
+  const firstColorInputId = useId();
+  const backwardColorInputId = useId();
+  const forwardColorInputId = useId();
 
   const [framesResult, setFramesResult] = useState<DeduplicatedFramesResponse | null>(
     null,
@@ -221,7 +258,17 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
   const [query, setQuery] = useState("");
   const [frameFrom, setFrameFrom] = useState<number>(1);
   const [frameTo, setFrameTo] = useState<number>(1);
-  const [boxColor, setBoxColor] = useState<string>(DEFAULT_BOX_COLOR);
+  const [firstPassColor, setFirstPassColor] = useState<string>(
+    DEFAULT_FIRST_PASS_COLOR,
+  );
+  const [backwardPassColor, setBackwardPassColor] = useState<string>(
+    DEFAULT_BACKWARD_PASS_COLOR,
+  );
+  // Forward-pass color is UI-only for now; forward pass itself is a later
+  // feature. Captured here so the picker can be wired without a refactor.
+  const [forwardPassColor, setForwardPassColor] = useState<string>(
+    DEFAULT_FORWARD_PASS_COLOR,
+  );
 
   const [detecting, setDetecting] = useState(false);
   const [detectError, setDetectError] = useState<string | null>(null);
@@ -236,7 +283,18 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
     to: number;
   } | null>(null);
 
+  const [backtracking, setBacktracking] = useState(false);
+  const [backtrackStats, setBacktrackStats] = useState<{
+    addedFrames: number;
+    addedBoxes: number;
+  } | null>(null);
+  // Ordered list of frame numbers that phase-2 actually added a box to in
+  // the most recent run. Rendered under the input so users can see which
+  // specific frames were touched by the backtrack.
+  const [backtrackTouched, setBacktrackTouched] = useState<number[]>([]);
+
   const detectAbortRef = useRef<AbortController | null>(null);
+  const backtrackAbortRef = useRef<AbortController | null>(null);
 
   const totalFrames = framesResult?.deduplicated_count ?? 0;
 
@@ -270,8 +328,14 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
     setDetectError(null);
     setQuery("");
     setRunProgress(null);
-    setBoxColor(DEFAULT_BOX_COLOR);
+    setFirstPassColor(DEFAULT_FIRST_PASS_COLOR);
+    setBackwardPassColor(DEFAULT_BACKWARD_PASS_COLOR);
+    setForwardPassColor(DEFAULT_FORWARD_PASS_COLOR);
+    setBacktracking(false);
+    setBacktrackStats(null);
+    setBacktrackTouched([]);
     detectAbortRef.current?.abort();
+    backtrackAbortRef.current?.abort();
   }, [file]);
 
   // When frames arrive (or count changes), default the range to the full span.
@@ -282,18 +346,39 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
     }
   }, [totalFrames]);
 
+  const frameLabels: FrameLabelMap = useMemo(() => {
+    if (totalFrames <= 0) return {};
+    const flat: Record<number, { width: number; height: number; boxes: typeof detections[number]["detection"]["boxes"] }> = {};
+    for (const [k, v] of Object.entries(detections)) {
+      flat[Number(k)] = {
+        width: v.detection.width,
+        height: v.detection.height,
+        boxes: v.detection.boxes,
+      };
+    }
+    return assignLabels(flat, totalFrames);
+  }, [detections, totalFrames]);
+
   const stats = useMemo(() => {
     let matched = 0;
-    let boxes = 0;
+    let primaryBoxes = 0;
+    let backtrackBoxes = 0;
     let covered = 0;
     for (const entry of Object.values(detections)) {
       covered += 1;
-      if (entry.detection.boxes.length > 0) {
-        matched += 1;
-        boxes += entry.detection.boxes.length;
+      if (entry.detection.boxes.length > 0) matched += 1;
+      for (const b of entry.detection.boxes) {
+        if (b.origin === "backtrack") backtrackBoxes += 1;
+        else primaryBoxes += 1;
       }
     }
-    return { matched, boxes, covered };
+    return {
+      matched,
+      boxes: primaryBoxes + backtrackBoxes,
+      primaryBoxes,
+      backtrackBoxes,
+      covered,
+    };
   }, [detections]);
 
   const onDetect = useCallback(
@@ -306,14 +391,21 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
       const to = Math.max(from, Math.min(totalFrames, Math.floor(frameTo)));
 
       detectAbortRef.current?.abort();
+      backtrackAbortRef.current?.abort();
       const ac = new AbortController();
       detectAbortRef.current = ac;
       setDetecting(true);
       setDetectError(null);
       setLastQuery(q);
       setRunProgress({ processed: 0, total: to - from + 1, from, to });
+      setBacktrackStats(null);
+      setBacktrackTouched([]);
 
-      const currentColor = boxColor;
+      // Snapshot the pickers at run start so later changes don't retroactively
+      // recolor this run's boxes (consistent with the existing per-run color
+      // semantics for the first pass).
+      const currentColor = firstPassColor;
+      const currentBackwardColor = backwardPassColor;
       // Clear prior entries inside the range only; preserve the rest.
       setDetections((prev) => {
         const next = { ...prev };
@@ -321,6 +413,8 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
         return next;
       });
 
+      // --- Phase 1: detect --------------------------------------------------
+      let phase1Ok = false;
       try {
         await streamDetect(
           file,
@@ -356,31 +450,120 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
           },
           ac.signal,
         );
+        phase1Ok = true;
       } catch (err) {
         if (ac.signal.aborted) return;
         setDetectError(
           err instanceof Error ? err.message : "Detection failed.",
         );
       } finally {
-        if (!ac.signal.aborted) {
-          setDetecting(false);
-        }
+        if (!ac.signal.aborted) setDetecting(false);
+      }
+
+      if (!phase1Ok || ac.signal.aborted) return;
+
+      // --- Phase 2: backtrack ----------------------------------------------
+      const bac = new AbortController();
+      backtrackAbortRef.current = bac;
+      setBacktracking(true);
+      try {
+        await streamBacktrack(
+          file,
+          q,
+          { frameFrom: from, frameTo: to },
+          (event) => {
+            if (event.type === "frame") {
+              setDetections((prev) => {
+                const existing = prev[event.index];
+                const taggedBox = { ...event.box, origin: "backtrack" as const };
+                if (existing) {
+                  return {
+                    ...prev,
+                    [event.index]: {
+                      ...existing,
+                      backtrackColor: currentBackwardColor,
+                      detection: {
+                        ...existing.detection,
+                        // Guard against duplicate appends if the backend
+                        // somehow re-emits the same (x,y,w,h).
+                        boxes: existing.detection.boxes.some(
+                          (b) =>
+                            b.x === taggedBox.x &&
+                            b.y === taggedBox.y &&
+                            b.w === taggedBox.w &&
+                            b.h === taggedBox.h &&
+                            b.origin === "backtrack",
+                        )
+                          ? existing.detection.boxes
+                          : [...existing.detection.boxes, taggedBox],
+                      },
+                    },
+                  };
+                }
+                return {
+                  ...prev,
+                  [event.index]: {
+                    detection: {
+                      width: event.width,
+                      height: event.height,
+                      boxes: [taggedBox],
+                    },
+                    color: currentColor,
+                    backtrackColor: currentBackwardColor,
+                  },
+                };
+              });
+              setBacktrackTouched((prev) =>
+                prev.includes(event.index) ? prev : [...prev, event.index],
+              );
+            } else if (event.type === "done") {
+              setBacktrackStats({
+                addedFrames: event.added_frames,
+                addedBoxes: event.added_boxes,
+              });
+            } else if (event.type === "error") {
+              setDetectError(event.message);
+            }
+          },
+          bac.signal,
+        );
+      } catch (err) {
+        if (bac.signal.aborted) return;
+        setDetectError(
+          err instanceof Error ? err.message : "Backtrack failed.",
+        );
+      } finally {
+        if (!bac.signal.aborted) setBacktracking(false);
       }
     },
-    [file, query, frameFrom, frameTo, boxColor, totalFrames],
+    [
+      file,
+      query,
+      frameFrom,
+      frameTo,
+      firstPassColor,
+      backwardPassColor,
+      totalFrames,
+    ],
   );
 
   const onCancel = useCallback(() => {
     detectAbortRef.current?.abort();
+    backtrackAbortRef.current?.abort();
     setDetecting(false);
+    setBacktracking(false);
   }, []);
 
   const onClearDetection = useCallback(() => {
     detectAbortRef.current?.abort();
+    backtrackAbortRef.current?.abort();
     setDetections({});
     setLastQuery("");
     setDetectError(null);
     setDetecting(false);
+    setBacktracking(false);
+    setBacktrackStats(null);
+    setBacktrackTouched([]);
     setRunProgress(null);
   }, []);
 
@@ -475,7 +658,7 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           placeholder="Text to find and redact (e.g. an email, a name)"
-          disabled={detecting || loading || !framesResult}
+          disabled={detecting || backtracking || loading || !framesResult}
           className="min-w-56 flex-1 rounded-md border border-border bg-background px-3 py-1.5 text-sm text-foreground outline-none placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-sky-500 disabled:opacity-60"
         />
 
@@ -495,7 +678,7 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
               const v = Number(e.target.value);
               setFrameFrom(Number.isFinite(v) ? v : 1);
             }}
-            disabled={detecting || loading || !framesResult}
+            disabled={detecting || backtracking || loading || !framesResult}
             className="w-14 bg-transparent text-foreground outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
           />
           <span aria-hidden="true" className="text-muted-foreground">
@@ -515,7 +698,7 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
               const v = Number(e.target.value);
               setFrameTo(Number.isFinite(v) ? v : 1);
             }}
-            disabled={detecting || loading || !framesResult}
+            disabled={detecting || backtracking || loading || !framesResult}
             className="w-14 bg-transparent text-foreground outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
           />
           <span className="ml-1 text-[10px] text-muted-foreground">
@@ -524,7 +707,7 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
           <button
             type="button"
             onClick={selectFullRange}
-            disabled={detecting || loading || !totalFrames}
+            disabled={detecting || backtracking || loading || !totalFrames}
             className="ml-1 rounded px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-40"
             title="Set range to all frames"
           >
@@ -532,23 +715,58 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
           </button>
         </div>
 
-        <label
-          htmlFor={colorInputId}
+        <div
           className="flex items-center gap-1.5 rounded-md border border-border bg-background px-2 py-1 text-xs text-muted-foreground"
-          title="Box color"
+          title="Box colors for each pass"
         >
-          <span>Color</span>
-          <input
-            id={colorInputId}
-            type="color"
-            value={boxColor}
-            onChange={(e) => setBoxColor(e.target.value)}
-            disabled={detecting}
-            className="h-5 w-7 cursor-pointer appearance-none rounded border border-border bg-transparent p-0 disabled:opacity-50"
-          />
-        </label>
+          <label
+            htmlFor={firstColorInputId}
+            className="flex items-center gap-1"
+            title="First pass (detect)"
+          >
+            <span>1st</span>
+            <input
+              id={firstColorInputId}
+              type="color"
+              value={firstPassColor}
+              onChange={(e) => setFirstPassColor(e.target.value)}
+              disabled={detecting || backtracking}
+              className="h-5 w-6 cursor-pointer appearance-none rounded border border-border bg-transparent p-0 disabled:opacity-50"
+            />
+          </label>
+          <label
+            htmlFor={backwardColorInputId}
+            className="flex items-center gap-1"
+            title="Backward pass (retro-fill partials from earlier frames)"
+          >
+            <span>Back</span>
+            <input
+              id={backwardColorInputId}
+              type="color"
+              value={backwardPassColor}
+              onChange={(e) => setBackwardPassColor(e.target.value)}
+              disabled={detecting || backtracking}
+              className="h-5 w-6 cursor-pointer appearance-none rounded border border-border bg-transparent p-0 disabled:opacity-50"
+            />
+          </label>
+          <label
+            htmlFor={forwardColorInputId}
+            className="flex items-center gap-1 opacity-60"
+            title="Forward pass (not yet implemented)"
+          >
+            <span>Fwd</span>
+            <input
+              id={forwardColorInputId}
+              type="color"
+              value={forwardPassColor}
+              onChange={(e) => setForwardPassColor(e.target.value)}
+              disabled={detecting || backtracking}
+              className="h-5 w-6 cursor-pointer appearance-none rounded border border-border bg-transparent p-0 disabled:opacity-50"
+            />
+          </label>
+        </div>
 
-        {detecting ? (
+        {detecting || backtracking ? (
           <button
             type="button"
             onClick={onCancel}
@@ -566,7 +784,7 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
           </button>
         )}
 
-        {stats.covered > 0 && !detecting && (
+        {stats.covered > 0 && !detecting && !backtracking && (
           <button
             type="button"
             onClick={onClearDetection}
@@ -587,7 +805,19 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
             </>
           )}
           found in {stats.matched}/{stats.covered} scanned frames ·{" "}
-          {stats.boxes} box{stats.boxes === 1 ? "" : "es"}
+          <span style={{ color: firstPassColor }}>
+            {stats.primaryBoxes} primary box
+            {stats.primaryBoxes === 1 ? "" : "es"}
+          </span>
+          {stats.backtrackBoxes > 0 && (
+            <>
+              {" "}
+              ·{" "}
+              <span style={{ color: backwardPassColor }}>
+                {stats.backtrackBoxes} backtracked
+              </span>
+            </>
+          )}
           {stats.covered < totalFrames && (
             <>
               {" "}
@@ -603,6 +833,42 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
         <p className="text-xs text-muted-foreground" aria-live="polite">
           Streaming OCR · frames {runProgress.from}–{runProgress.to} ·{" "}
           {runProgress.processed}/{runProgress.total} processed
+        </p>
+      )}
+
+      {backtracking && !detecting && (
+        <p className="text-xs text-muted-foreground" aria-live="polite">
+          Backtracking partials across earlier frames…
+        </p>
+      )}
+
+      {!detecting && !backtracking && backtrackStats && (
+        <p className="text-[11px] text-muted-foreground">
+          <span style={{ color: backwardPassColor }}>Backtrack</span> added{" "}
+          {backtrackStats.addedBoxes} box
+          {backtrackStats.addedBoxes === 1 ? "" : "es"} across{" "}
+          {backtrackStats.addedFrames} frame
+          {backtrackStats.addedFrames === 1 ? "" : "s"}
+          {backtrackTouched.length > 0 && (
+            <>
+              {": "}
+              {backtrackTouched
+                .slice()
+                .sort((a, b) => a - b)
+                .map((n, i, arr) => (
+                  <span key={`bt-${n}`}>
+                    <span
+                      className="font-mono text-foreground"
+                      style={{ color: backwardPassColor }}
+                    >
+                      #{n}
+                    </span>
+                    {i < arr.length - 1 ? ", " : ""}
+                  </span>
+                ))}
+            </>
+          )}
+          .
         </p>
       )}
 
@@ -641,6 +907,7 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
           {framesResult.frames.map((f, i) => {
             const frameNumber = i + 1;
             const entry = detections[frameNumber];
+            const labelsForFrame = frameLabels[frameNumber];
             const hasRaw = entry?.raw !== undefined;
             const isCopied = copiedIndex === frameNumber;
             return (
@@ -658,19 +925,46 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
                     className="block w-full"
                     loading="lazy"
                   />
-                  <DetectionOverlay entry={entry} />
+                  <DetectionOverlay entry={entry} labels={labelsForFrame} />
                   <span className="pointer-events-none absolute bottom-1.5 left-1.5 rounded bg-black/60 px-1.5 py-0.5 text-[10px] font-medium text-white">
                     #{frameNumber}
                   </span>
-                  {entry?.detection.boxes.length ? (
-                    <span
-                      className="pointer-events-none absolute bottom-1.5 right-1.5 rounded px-1.5 py-0.5 text-[10px] font-medium text-white"
-                      style={{ backgroundColor: entry.color }}
-                    >
-                      {entry.detection.boxes.length} hit
-                      {entry.detection.boxes.length === 1 ? "" : "s"}
-                    </span>
-                  ) : null}
+                  {entry?.detection.boxes.length ? (() => {
+                    const primary = entry.detection.boxes.filter(
+                      (b) => b.origin !== "backtrack",
+                    ).length;
+                    const back = entry.detection.boxes.length - primary;
+                    const badgeBg =
+                      primary > 0
+                        ? entry.color
+                        : entry.backtrackColor ?? BACKTRACK_COLOR;
+                    // Letter list, deduped and in first-encountered order.
+                    const uniqueLabels: string[] = [];
+                    if (labelsForFrame) {
+                      for (const l of labelsForFrame) {
+                        if (!uniqueLabels.includes(l)) uniqueLabels.push(l);
+                      }
+                    }
+                    const letterLabel =
+                      uniqueLabels.length > 0
+                        ? uniqueLabels.join("\u00b7")
+                        : primary > 0 && back > 0
+                          ? `${primary}+${back}`
+                          : String(primary || back);
+                    return (
+                      <span
+                        className="pointer-events-none absolute bottom-1.5 right-1.5 rounded px-1.5 py-0.5 font-mono text-[10px] font-semibold text-white"
+                        style={{ backgroundColor: badgeBg }}
+                        title={
+                          back > 0
+                            ? `${primary} primary + ${back} backtracked`
+                            : `${primary} hit${primary === 1 ? "" : "s"}`
+                        }
+                      >
+                        {letterLabel}
+                      </span>
+                    );
+                  })() : null}
                 </button>
                 <button
                   type="button"
@@ -695,6 +989,7 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
         <FrameLightbox
           frames={framesResult.frames}
           detections={detections}
+          frameLabels={frameLabels}
           index={openIndex}
           onClose={() => setOpenIndex(null)}
           onNavigate={setOpenIndex}

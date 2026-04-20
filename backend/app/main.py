@@ -15,6 +15,7 @@ from fastapi.responses import StreamingResponse
 from app.frame_cache import get_or_extract
 from app.frame_service import FrameExtractionError
 from app.logging_config import configure as configure_logging
+from app import ocr_backtrack, ocr_cache
 from app.ocr_service import (
     detect_frame,
     ensure_reader_loaded,
@@ -276,6 +277,18 @@ async def detect_stream(
             q_norm,
         )
 
+        # Create a fresh OCR cache entry; each completed frame populates it so
+        # the /api/ocr/backtrack endpoint can walk the same data in reverse
+        # without re-calling Textract.
+        cache_entry = ocr_cache.create_entry(
+            video_hash=video_hash,
+            query_norm=q_norm,
+            fps=fps,
+            dedup_threshold=dedup_threshold,
+            frame_from=lo_1,
+            frame_to=hi_1,
+        )
+
         loop_t0 = time.perf_counter()
         per_frame_ms: list[float] = []
 
@@ -287,6 +300,14 @@ async def detect_stream(
                 det, raw = await asyncio.to_thread(detect_frame, blob, q_norm)
                 work_ms = (time.perf_counter() - t_work) * 1000
                 per_frame_ms.append(work_ms)
+                ocr_cache.put_frame(
+                    cache_entry,
+                    frame_idx_1=idx_1,
+                    width=det.width,
+                    height=det.height,
+                    matched=list(det.boxes),
+                    raw=raw,
+                )
                 log.info(
                     "frame #%d: wait=%.0fms work=%.0fms matches=%d",
                     idx_1,
@@ -385,6 +406,242 @@ async def detect_stream(
         media_type="application/x-ndjson",
         headers={
             # Disable proxy buffering so events arrive incrementally.
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+async def _populate_phase1_for_backtrack(
+    *,
+    frame_set,
+    video_hash: str,
+    q_norm: str,
+    fps: float | None,
+    dedup_threshold: int,
+    lo_1: int,
+    hi_1: int,
+) -> ocr_cache.OcrEntry:
+    """Run phase-1 detection over the selected frames into the OCR cache.
+
+    Used by /api/ocr/backtrack when no cached entry exists for the given
+    (video_hash, query_norm, fps, dedup_threshold, range). Same fan-out
+    strategy as detect_stream, just no NDJSON emission.
+    """
+    await asyncio.to_thread(ensure_reader_loaded)
+    entry = ocr_cache.create_entry(
+        video_hash=video_hash,
+        query_norm=q_norm,
+        fps=fps,
+        dedup_threshold=dedup_threshold,
+        frame_from=lo_1,
+        frame_to=hi_1,
+    )
+    sem = asyncio.Semaphore(_STREAM_OCR_CONCURRENCY)
+
+    async def run_one(idx_1: int, blob: bytes):
+        async with sem:
+            det, raw = await asyncio.to_thread(detect_frame, blob, q_norm)
+            ocr_cache.put_frame(
+                entry,
+                frame_idx_1=idx_1,
+                width=det.width,
+                height=det.height,
+                matched=list(det.boxes),
+                raw=raw,
+            )
+
+    tasks = [
+        asyncio.create_task(run_one(i_1, frame_set.frames[i_1 - 1]))
+        for i_1 in range(lo_1, hi_1 + 1)
+    ]
+    try:
+        await asyncio.gather(*tasks)
+    except Exception:
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        raise
+    return entry
+
+
+@app.post("/api/ocr/backtrack")
+async def backtrack_stream(
+    file: UploadFile = File(...),
+    query: str = Form(..., min_length=1, max_length=200),
+    frame_from: int = Form(1, ge=1),
+    frame_to: int | None = Form(None),
+    fps: float | None = Form(None),
+    dedup_threshold: int = Form(4),
+) -> StreamingResponse:
+    """Stream backtracked OCR hits as NDJSON.
+
+    Walks frames in reverse and, for each genuinely new hit (no
+    corresponding hit in the previous frame), looks for a partial of the
+    query near the same region in frame n-1. Iteratively recurses backward.
+
+    Events:
+      {"type":"start", "video_hash", "query", "frame_from", "frame_to",
+       "total_frames"}
+      {"type":"frame", "index": i, "width":..., "height":...,
+       "box": {x,y,w,h,text,score}, "origin": "backtrack"}
+      {"type":"done", "added_frames": k, "added_boxes": b}
+      {"type":"error", "message": "..."}
+    """
+    _validate_video(file)
+    t_req = time.perf_counter()
+    body = await file.read()
+    if not body:
+        raise HTTPException(status_code=400, detail="Empty file.")
+    if len(body) > _MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="File too large.")
+    if fps is not None and fps <= 0:
+        fps = None
+
+    log.info(
+        "backtrack: recv file=%r bytes=%d query=%r range=%s..%s "
+        "fps=%s dedup_threshold=%d",
+        file.filename,
+        len(body),
+        query,
+        frame_from,
+        frame_to,
+        fps,
+        dedup_threshold,
+    )
+
+    suffix = _guess_suffix(file.filename)
+    try:
+        frame_set, video_hash = get_or_extract(
+            body,
+            suffix=suffix,
+            fps=fps,
+            dedup_threshold=dedup_threshold,
+        )
+    except FrameExtractionError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+
+    n = frame_set.kept_count
+    if n == 0:
+        raise HTTPException(status_code=422, detail="No frames to process.")
+
+    lo_1 = max(1, frame_from)
+    hi_1 = frame_to if frame_to is not None else n
+    hi_1 = min(max(1, hi_1), n)
+    if lo_1 > hi_1:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid frame range: from={frame_from}, to={frame_to}",
+        )
+
+    q_norm = normalize_query(query)
+
+    async def stream() -> AsyncIterator[bytes]:
+        yield _ndjson(
+            {
+                "type": "start",
+                "video_hash": video_hash,
+                "query": query,
+                "frame_from": lo_1,
+                "frame_to": hi_1,
+                "total_frames": hi_1 - lo_1 + 1,
+            }
+        )
+
+        if not q_norm:
+            yield _ndjson(
+                {"type": "done", "added_frames": 0, "added_boxes": 0}
+            )
+            return
+
+        entry = ocr_cache.get_entry(
+            video_hash=video_hash,
+            query_norm=q_norm,
+            fps=fps,
+            dedup_threshold=dedup_threshold,
+            frame_from=lo_1,
+            frame_to=hi_1,
+        )
+        if entry is None:
+            log.info(
+                "backtrack: no cached phase-1 for query=%r range=%d..%d; "
+                "running inline",
+                q_norm,
+                lo_1,
+                hi_1,
+            )
+            try:
+                entry = await _populate_phase1_for_backtrack(
+                    frame_set=frame_set,
+                    video_hash=video_hash,
+                    q_norm=q_norm,
+                    fps=fps,
+                    dedup_threshold=dedup_threshold,
+                    lo_1=lo_1,
+                    hi_1=hi_1,
+                )
+            except Exception as e:  # pragma: no cover
+                log.exception("backtrack: inline phase-1 failed")
+                yield _ndjson(
+                    {"type": "error", "message": f"phase-1 failed: {e}"}
+                )
+                return
+
+        # Run the backtrack driver on a worker thread so we don't block the
+        # event loop while we crunch through (potentially large) raw
+        # Textract payloads.
+        t_back = time.perf_counter()
+        try:
+            added = await asyncio.to_thread(ocr_backtrack.run_backtrack, entry)
+        except Exception as e:  # pragma: no cover
+            log.exception("backtrack: driver failed")
+            yield _ndjson({"type": "error", "message": str(e)})
+            return
+        back_ms = (time.perf_counter() - t_back) * 1000
+
+        frames_touched: set[int] = set()
+        for hit in added:
+            frames_touched.add(hit.frame_idx_1)
+            prev = entry.per_frame.get(hit.frame_idx_1)
+            yield _ndjson(
+                {
+                    "type": "frame",
+                    "index": hit.frame_idx_1,
+                    "width": prev.width if prev else 0,
+                    "height": prev.height if prev else 0,
+                    "box": {
+                        "x": hit.box.x,
+                        "y": hit.box.y,
+                        "w": hit.box.w,
+                        "h": hit.box.h,
+                        "text": hit.box.text,
+                        "score": round(hit.box.score, 3),
+                    },
+                    "origin": "backtrack",
+                }
+            )
+
+        total_req = time.perf_counter() - t_req
+        log.info(
+            "backtrack: done added_frames=%d added_boxes=%d "
+            "driver=%.0fms req_wall=%.1fs",
+            len(frames_touched),
+            len(added),
+            back_ms,
+            total_req,
+        )
+        yield _ndjson(
+            {
+                "type": "done",
+                "added_frames": len(frames_touched),
+                "added_boxes": len(added),
+            }
+        )
+
+    return StreamingResponse(
+        stream(),
+        media_type="application/x-ndjson",
+        headers={
             "Cache-Control": "no-cache, no-transform",
             "X-Accel-Buffering": "no",
         },
