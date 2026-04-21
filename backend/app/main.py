@@ -729,10 +729,17 @@ async def forward_stream(
 def _parse_export_boxes(raw: object) -> list[video_export.ExportBox]:
     """Flatten the client's `boxes_by_frame` mapping into a list.
 
-    Accepts `{ "<frame_idx_1>": [ { x, y, w, h }, ... ], ... }`. Unknown
-    keys are ignored; invalid boxes are dropped rather than failing the
-    whole request (the UI stats may legitimately carry zero-area entries
+    Accepts ``{ "<frame_idx_1>": [ { x, y, w, h, track_id? }, ... ], ... }``.
+    Unknown keys are ignored; invalid boxes are dropped rather than failing
+    the whole request (the UI stats may legitimately carry zero-area entries
     after a no-op re-run).
+
+    ``track_id`` is optional: when present and shared between a box at
+    frame ``F`` and a box at frame ``F+1``, the exporter will interpolate
+    the drawbox coords across that window so the redaction tweens
+    smoothly (see ``video_export.build_drawbox_filter``). Absent or empty
+    track ids render statically for the full keyframe window, matching
+    legacy (pre-linker) behavior.
     """
     if not isinstance(raw, dict):
         return []
@@ -756,9 +763,20 @@ def _parse_export_boxes(raw: object) -> list[video_export.ExportBox]:
                 continue
             if w <= 0 or h <= 0:
                 continue
+            track_raw = entry.get("track_id")
+            track_id = (
+                track_raw
+                if isinstance(track_raw, str) and track_raw
+                else None
+            )
             out.append(
                 video_export.ExportBox(
-                    frame=frame_1, x=x, y=y, w=w, h=h,
+                    frame=frame_1,
+                    x=x,
+                    y=y,
+                    w=w,
+                    h=h,
+                    track_id=track_id,
                 )
             )
     return out

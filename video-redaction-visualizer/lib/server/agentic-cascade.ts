@@ -46,23 +46,28 @@
 //   - finish(summary, still_visible) → stops the focused agent and signals
 //                                      the cascade whether to advance
 
-import { generateText, stepCountIs, tool } from "ai";
+import { generateText, stepCountIs, tool, type LanguageModelUsage } from "ai";
 import { z } from "zod";
 import { aerr, alog } from "./agentic-log";
+import { addUsage, emptyUsage, geminiCost, type AggregateUsage } from "./cost";
 import type { NavFrameState, NavHit, NavigatorEvent } from "./agentic-navigator";
+import { resolveFixTrackId } from "./linker-fallback";
 import {
   BOX_FORMAT_NOTE,
   agenticBuiltinTools,
   agenticCascadeConcurrency,
   agenticCascadeMaxAgents,
   agenticCascadeMaxDepth,
+  agenticCascadeQuietCap,
   agenticCodeExecutionEnabled,
   agenticFocusedMaxSteps,
   agenticLanguageModel,
+  agenticModelId,
   agenticProviderOptions,
   bboxToPixels,
   pixelBoxToNormalizedBbox,
 } from "./openrouter";
+import { compact, type RunLog } from "./run-log";
 
 // Same lightweight shape used by agentic-navigator.
 type TextractBlock = {
@@ -104,16 +109,31 @@ export type ChainSeed = {
 
 /**
  * Build chain seeds from phase-1 hits by walking every adjacent-frame pair
- * and pulling out the hits that appeared / disappeared. Dedup'd by
- * (text, direction) so a cell whose content repeatedly flickers doesn't
- * spawn N redundant chains.
+ * and pulling out the hits that appeared / disappeared.
+ *
+ * Every genuine transition gets its own seed — we deliberately do NOT
+ * dedup by ``(text, direction)`` across the run. Distinct transitions of
+ * the same text are distinct events with distinct investigations. Two
+ * concrete examples this run surfaced:
+ *
+ *   1. ``test wor`` scrolls out of view at transition 13→14 (intro
+ *      horizontal scroll) and the cascade should chase forward from f14
+ *      to find the fading-edge partials.
+ *   2. Much later, ``test wor`` is covered by a font-picker popup at
+ *      52→53 and the cascade should chase forward from f53 to find the
+ *      sliver of "or" still visible to the right of the popup.
+ *
+ * A global ``(text, direction)`` dedup silently swallows case 2 — the
+ * key is already claimed by case 1 — so the popup-occluded sliver never
+ * gets investigated and leaks through to export. Duplicate seeds that
+ * target an already-inspected frame are already cheaply suppressed at
+ * runtime by the ``frame_already_claimed`` chain-stop (per-direction
+ * `claimed` set in ``runCascadeNavigator``), so removing this upstream
+ * dedup costs effectively nothing but gains correctness on any video
+ * where the same text disappears/reappears for different reasons.
  */
 export function findChainSeeds(frames: NavFrameState[]): ChainSeed[] {
   const seeds: ChainSeed[] = [];
-  const seen = new Set<string>();
-
-  const key = (text: string, direction: "backward" | "forward"): string =>
-    `${direction}::${text.trim().toLowerCase()}`;
 
   const toTracked = (h: NavHit, f: NavFrameState): TrackedHit => ({
     text: h.text,
@@ -133,9 +153,6 @@ export function findChainSeeds(frames: NavFrameState[]): ChainSeed[] {
     for (const h of cur.hits) {
       const t = h.text.trim().toLowerCase();
       if (prevTexts.has(t)) continue;
-      const k = key(h.text, "backward");
-      if (seen.has(k)) continue;
-      seen.add(k);
       seeds.push({
         tracked: toTracked(h, cur),
         direction: "backward",
@@ -147,9 +164,6 @@ export function findChainSeeds(frames: NavFrameState[]): ChainSeed[] {
     for (const h of prev.hits) {
       const t = h.text.trim().toLowerCase();
       if (curTexts.has(t)) continue;
-      const k = key(h.text, "forward");
-      if (seen.has(k)) continue;
-      seen.add(k);
       seeds.push({
         tracked: toTracked(h, prev),
         direction: "forward",
@@ -184,6 +198,7 @@ type FocusedAgentOpts = {
   spawnReason: string;
   onEvent: (ev: NavigatorEvent) => void;
   abortSignal?: AbortSignal;
+  runLog?: RunLog | null;
 };
 
 type FocusedAgentResult = {
@@ -199,6 +214,8 @@ type FocusedAgentResult = {
    * `finish` — treated as "still visible" so the cascade is conservative.
    */
   stillVisible: boolean | null;
+  /** AI SDK token usage summed across this agent's steps. */
+  usage: LanguageModelUsage | null;
 };
 
 async function runFocusedAgent(opts: FocusedAgentOpts): Promise<FocusedAgentResult> {
@@ -215,6 +232,7 @@ async function runFocusedAgent(opts: FocusedAgentOpts): Promise<FocusedAgentResu
     spawnReason,
     onEvent,
     abortSignal,
+    runLog,
   } = opts;
 
   const frameByIndex = new Map<number, NavFrameState>();
@@ -256,6 +274,37 @@ async function runFocusedAgent(opts: FocusedAgentOpts): Promise<FocusedAgentResu
       };
     }
     return null;
+  };
+
+  // Resolve a track_id for a newly-added fix box on the focus frame.
+  // Looks at immediate neighbors (both in the agent's context window) to
+  // see if the new box is a continuation of an already-tracked
+  // redaction; if not, mints a fresh id keyed off hit_id. Called from
+  // add_box and adopt_ocr_box right before the hit is committed so the
+  // UI / exporter see track_ids on fix boxes and can interpolate them
+  // like phase-1.5-linked boxes.
+  const trackIdForFix = (hit: NavHit): string => {
+    const prev = frameByIndex.get(focusFrame - 1);
+    const next = frameByIndex.get(focusFrame + 1);
+    const claimed = new Set<string>();
+    for (const h of focus.hits) {
+      if (h.track_id) claimed.add(h.track_id);
+    }
+    return resolveFixTrackId({
+      agentId,
+      frameIndex: focusFrame,
+      hitId: hit.hit_id,
+      newBox: hit,
+      newFrameWidth: focus.width,
+      newFrameHeight: focus.height,
+      prevFrame: prev
+        ? { hits: prev.hits, width: prev.width, height: prev.height }
+        : null,
+      nextFrame: next
+        ? { hits: next.hits, width: next.width, height: next.height }
+        : null,
+      claimedOnCurrentFrame: claimed,
+    });
   };
 
   // ---- Tools -----------------------------------------------------------
@@ -378,7 +427,7 @@ async function runFocusedAgent(opts: FocusedAgentOpts): Promise<FocusedAgentResu
   });
 
   const addBoxTool = tool({
-    description: `Add a new redaction box on frame ${focusFrame} (THIS agent's focus frame). Coords are Gemini's native box_2d format: [y_min, x_min, y_max, x_max] in 0..1000 (top-left origin). Copy coords from get_ocr_text output whenever possible.`,
+    description: `Add a new redaction box on frame ${focusFrame} (THIS agent's focus frame). Coords are Gemini's native box_2d format: [y_min, x_min, y_max, x_max] in 0..1000 (top-left origin). STRICT coord-source priority: (1) copy from a get_ocr_text WORD/LINE block on this frame; (2) measure from a code_execution crop of this frame; (3) pure estimation ONLY as last resort. DO NOT copy the anchor frame's bbox and DO NOT invent coords from UI semantics ("formula bar should show…", "selected cell F27 would be here…"). The \`reason\` field must name the tier and the evidence (e.g. "Tier 1: OCR WORD 'or' at [y,x,y,x]=..." or "Tier 2: code_execution crop (x,y,w,h)=...").`,
     inputSchema: z.object({
       frame_index: z.number().int(),
       text: z.string(),
@@ -416,6 +465,7 @@ async function runFocusedAgent(opts: FocusedAgentOpts): Promise<FocusedAgentResu
         hit_id: mintHitId(),
         reason: reason ?? undefined,
       };
+      hit.track_id = trackIdForFix(hit);
       focus.hits.push(hit);
       added += 1;
       onEvent({
@@ -429,6 +479,7 @@ async function runFocusedAgent(opts: FocusedAgentOpts): Promise<FocusedAgentResu
       return {
         ok: true as const,
         hit_id: hit.hit_id,
+        track_id: hit.track_id,
         pixel_box: { x: hit.x, y: hit.y, w: hit.w, h: hit.h },
       };
     },
@@ -495,6 +546,7 @@ async function runFocusedAgent(opts: FocusedAgentOpts): Promise<FocusedAgentResu
         hit_id: mintHitId(),
         reason: reason ?? undefined,
       };
+      hit.track_id = trackIdForFix(hit);
       focus.hits.push(hit);
       added += 1;
       onEvent({
@@ -508,6 +560,7 @@ async function runFocusedAgent(opts: FocusedAgentOpts): Promise<FocusedAgentResu
       return {
         ok: true as const,
         hit_id: hit.hit_id,
+        track_id: hit.track_id,
         pixel_box: { x: hit.x, y: hit.y, w: hit.w, h: hit.h },
       };
     },
@@ -585,13 +638,26 @@ async function runFocusedAgent(opts: FocusedAgentOpts): Promise<FocusedAgentResu
     "",
     "YOUR PROCESS",
     "1. Call get_frame(focus) to see the image + existing hits + query-filtered OCR candidates.",
-    `2. For each substring-of-interest in "${tracked.text}", call get_ocr_text(focus, filter=<substring>) to find ANY Textract block matching it — even blocks that didn't pass the query's fuzzy filter (e.g. standalone 'WORD', standalone 'tes'). These blocks have pixel-accurate bboxes; COPY THEIR COORDS into add_box rather than estimating.`,
+    `2. For each substring-of-interest in "${tracked.text}", call get_ocr_text(focus, filter=<substring>) to find ANY Textract block matching it — even blocks that didn't pass the query's fuzzy filter (e.g. standalone 'WORD', standalone 'tes', 'or', 'wor'). Try multiple substrings; OCR is the ground truth for what text is actually rendered on this frame.`,
+    "",
+    "COORDINATE SOURCE — STRICT PRIORITY ORDER (do NOT skip tiers)",
+    "Tier 1 — OCR coords (REQUIRED FIRST ATTEMPT).",
+    "   Every add_box should copy its bbox from a Textract WORD or LINE block returned by get_ocr_text on THIS frame. Prefer the narrowest block that contains the visible fragment (e.g. the standalone 'or' WORD, not the anchor's full 'test wor' width). Use adopt_ocr_box when the block is in the query-filtered candidate list.",
     agenticCodeExecutionEnabled()
-      ? `3. When a partial is ambiguous (e.g. tiny text, edge-clipped, hard to tell from a screenshot), use the code_execution tool to write Python that crops & zooms the focus frame to the region in question. Inspect the cropped image and measure bbox coords from it. This is much more precise than visual estimation.`
-      : `3. When a partial is ambiguous (tiny text, edge-clipped), re-read the frame carefully; prefer OCR blocks when available.`,
-    `4. If partial content is visible but NOT already covered by an existing hit, add_box (preferring OCR coords; code-execution-measured coords second; visual estimation only as last resort — mention your source in \`reason\`).`,
-    "5. If the focus frame already has a hit that fully covers the visible partial, no action needed.",
-    "6. Call finish(summary, still_visible) to end.",
+      ? "Tier 2 — Visual reasoning with code_execution (use ONLY if no OCR block covers the visible fragment).\n   Write Python that crops & zooms the focus frame image to the region you suspect, inspect the crop, and measure pixel bbox coords from the zoomed image. Report the measured coords in `reason`. This is the only acceptable fallback when the fragment is sub-OCR-threshold or edge-clipped beyond OCR's reach."
+      : "Tier 2 — Careful visual re-read of the focus frame (use ONLY if no OCR block covers the visible fragment). Zoom with get_frame again and measure precisely. Describe your measurement method in `reason`.",
+    "Tier 3 — Pure estimation (LAST RESORT — avoid unless Tiers 1 and 2 have both been attempted and failed).",
+    "   Only permitted when a fragment is clearly visible to you but neither OCR nor a code-execution crop can produce coords (rare). Must be explicitly justified in `reason`, including why Tiers 1 and 2 failed.",
+    "",
+    "HARD RULES — coordinate invention is a bug",
+    "  - NEVER copy the anchor frame's bbox verbatim onto this frame. The anchor bbox is a SPATIAL PRIOR only — useful for deciding where to LOOK, never as add_box coords.",
+    "  - NEVER fabricate coords from UI semantics alone (e.g. 'the formula bar shows the selected cell's content, so there must be text there'). If OCR doesn't see it and you can't crop-and-measure it, it is NOT visible for redaction purposes on this frame.",
+    "  - NEVER widen an OCR block to match the anchor's width. If only 'or' is visible, redact ONLY the 'or' block's bbox.",
+    "  - If you catch yourself about to add a box whose `reason` is 'same position as anchor' or 'should be in <UI element>', STOP. Either find a supporting OCR block or a code-execution measurement, or do not add the box.",
+    "",
+    "3. If partial content is visible but NOT already covered by an existing hit, add_box using coords from the highest-priority tier that succeeded. Mention the tier and source in `reason` (e.g. 'Tier 1: OCR WORD block `or` at ocr_index=N' / 'Tier 2: code_execution crop measured (x,y,w,h)=…').",
+    "4. If the focus frame already has a hit that fully covers the visible partial, no action needed.",
+    "5. Call finish(summary, still_visible) to end. If neither OCR nor code-execution found the fragment on this frame, that's strong evidence `still_visible=false` — don't invent coords just to keep the cascade alive.",
     "",
     "STOP SEMANTICS — `still_visible`",
     "true  → tracked content (or any partial / variant / fragment) is still visible on this frame OR could plausibly appear in the next cascade step (viewport edge, fading in/out). Cascade will propagate one more frame.",
@@ -612,7 +678,7 @@ async function runFocusedAgent(opts: FocusedAgentOpts): Promise<FocusedAgentResu
     "Focus frame state (as seen after phase-1):",
     JSON.stringify(focusSummary, null, 2),
     "",
-    "Inspect the focus frame for ANY visible partial of the tracked content. Prefer OCR-copied bboxes. Redact if needed, then call finish with still_visible set appropriately.",
+    "Inspect the focus frame for ANY visible partial of the tracked content. Follow the STRICT coord-source priority: (1) OCR block → (2) code_execution crop measurement → (3) estimation. Never copy the anchor bbox verbatim and never invent coords from UI semantics. If neither OCR nor code-execution finds the fragment on this frame, return still_visible=false rather than fabricating a box. Then call finish.",
   ].join("\n");
 
   alog(`[${agentId}] start`, {
@@ -625,13 +691,33 @@ async function runFocusedAgent(opts: FocusedAgentOpts): Promise<FocusedAgentResu
     tracked_source_frame: tracked.source_frame,
     max_steps: agenticFocusedMaxSteps(),
   });
+  runLog?.write({
+    kind: "agent_start",
+    agent_id: agentId,
+    focus_frame: focusFrame,
+    source,
+    parent_agent_id: parentAgentId,
+    direction,
+    depth_from_source: depthFromSource,
+    tracked: {
+      text: tracked.text,
+      source_frame: tracked.source_frame,
+      source_bbox: tracked.source_bbox,
+    },
+    spawn_reason: spawnReason,
+    max_steps: agenticFocusedMaxSteps(),
+    system_prompt: systemPrompt,
+    user_prompt: userPrompt,
+  });
 
   // ---- Run -------------------------------------------------------------
 
   const model = agenticLanguageModel();
+  const agentT0 = Date.now();
 
+  let usage: LanguageModelUsage | null = null;
   try {
-    await generateText({
+    const r = await generateText({
       model,
       tools,
       system: systemPrompt,
@@ -667,12 +753,48 @@ async function runFocusedAgent(opts: FocusedAgentOpts): Promise<FocusedAgentResu
             agent_id: agentId,
           });
         }
+        // Full step payload to the run log (text + tool I/O + usage).
+        runLog?.write({
+          kind: "agent_step",
+          agent_id: agentId,
+          step: stepNum,
+          text: step.text ?? "",
+          reasoning_text: step.reasoningText ?? null,
+          finish_reason: step.finishReason,
+          tool_calls: step.toolCalls?.map((c) => ({
+            name: c.toolName,
+            id: c.toolCallId,
+            input: compact(c.input),
+          })),
+          tool_results: step.toolResults?.map((r) => ({
+            name: r.toolName,
+            id: r.toolCallId,
+            output: compact(r.output),
+          })),
+          usage: step.usage,
+        });
       },
     });
+    usage = r.usage ?? null;
   } catch (e) {
     aerr(`[${agentId}] generateText failed`, e);
+    runLog?.write({
+      kind: "agent_error",
+      agent_id: agentId,
+      focus_frame: focusFrame,
+      error: e instanceof Error ? e.message : String(e),
+    });
     throw e;
   }
+
+  const agentElapsed = Date.now() - agentT0;
+  const agentCost = geminiCost(agenticModelId(), {
+    inputTokens: usage?.inputTokens ?? 0,
+    outputTokens: usage?.outputTokens ?? 0,
+    reasoningTokens: usage?.outputTokenDetails?.reasoningTokens ?? 0,
+    cachedInputTokens: usage?.inputTokenDetails?.cacheReadTokens ?? 0,
+    callCount: 1,
+  });
 
   alog(`[${agentId}] end`, {
     focusFrame,
@@ -681,6 +803,24 @@ async function runFocusedAgent(opts: FocusedAgentOpts): Promise<FocusedAgentResu
     totalSteps: steps,
     finishSummary,
     stillVisible,
+    input_tokens: usage?.inputTokens ?? null,
+    output_tokens: usage?.outputTokens ?? null,
+    cost_usd: agentCost.totalUSD,
+  });
+  runLog?.write({
+    kind: "agent_end",
+    agent_id: agentId,
+    focus_frame: focusFrame,
+    added,
+    removed,
+    total_steps: steps,
+    finish_summary: finishSummary,
+    still_visible: stillVisible,
+    elapsed_ms: agentElapsed,
+    usage,
+    cost_usd: agentCost.totalUSD,
+    input_usd: agentCost.inputUSD,
+    output_usd: agentCost.outputUSD,
   });
 
   onEvent({
@@ -691,6 +831,8 @@ async function runFocusedAgent(opts: FocusedAgentOpts): Promise<FocusedAgentResu
     removed,
     total_steps: steps,
     finish_summary: finishSummary,
+    usage,
+    cost_usd: agentCost.totalUSD,
   });
 
   return {
@@ -701,6 +843,7 @@ async function runFocusedAgent(opts: FocusedAgentOpts): Promise<FocusedAgentResu
     totalSteps: steps,
     finishSummary,
     stillVisible,
+    usage,
   };
 }
 
@@ -740,6 +883,11 @@ export type CascadeOpts = {
   frames: NavFrameState[];
   onEvent: (ev: NavigatorEvent) => void;
   abortSignal?: AbortSignal;
+  /**
+   * Optional per-run JSONL log. Cascade writes agent_start / agent_step /
+   * agent_end / agent_error + cascade_chain_stopped / cascade_summary.
+   */
+  runLog?: RunLog | null;
 };
 
 export type CascadeResult = {
@@ -749,6 +897,8 @@ export type CascadeResult = {
   totalAgents: number;
   transitions: number;
   finishSummary: string | null;
+  /** Aggregate token usage across every focused agent in the run. */
+  usage: AggregateUsage;
 };
 
 /**
@@ -768,7 +918,7 @@ export type CascadeResult = {
 export async function runCascadeNavigator(
   opts: CascadeOpts,
 ): Promise<CascadeResult> {
-  const { query, frames, onEvent, abortSignal } = opts;
+  const { query, frames, onEvent, abortSignal, runLog } = opts;
   const frameByIndex = new Map<number, NavFrameState>();
   for (const f of frames) frameByIndex.set(f.index, f);
   const rangeLo = frames[0]?.index ?? 0;
@@ -786,6 +936,18 @@ export async function runCascadeNavigator(
       first_focus: s.first_focus,
     })),
   });
+  runLog?.write({
+    kind: "cascade_seeds",
+    total_frames: frames.length,
+    range: [rangeLo, rangeHi],
+    seeds: seeds.map((s) => ({
+      direction: s.direction,
+      text: s.tracked.text,
+      source_frame: s.tracked.source_frame,
+      source_bbox: s.tracked.source_bbox,
+      first_focus: s.first_focus,
+    })),
+  });
 
   // Per-direction claim maps. A single frame CAN be visited once by a
   // backward chain and once by a forward chain — they are tracking
@@ -796,13 +958,23 @@ export async function runCascadeNavigator(
     forward: new Set(),
   };
 
+  // Shared helper so every chain-stop reason is emitted to both the
+  // server console (alog) and the per-run JSONL (runLog) with identical
+  // payloads.
+  const logChainStop = (payload: Record<string, unknown>): void => {
+    alog("cascade chain stopped", payload);
+    runLog?.write({ kind: "chain_stopped", ...payload });
+  };
+
   let agentCounter = 0;
   let totalAdded = 0;
   let totalRemoved = 0;
   let totalSteps = 0;
   let totalAgents = 0;
+  const totalUsage = emptyUsage();
   const maxAgents = agenticCascadeMaxAgents();
   const maxDepth = agenticCascadeMaxDepth();
+  const quietCap = agenticCascadeQuietCap();
 
   // Context window for a given focus frame: focus + both immediate
   // neighbors. Small enough to keep per-agent token cost modest, wide
@@ -826,6 +998,12 @@ export async function runCascadeNavigator(
     let parentAgentId: string | null = null;
     let depth = 1; // depth from anchor; seed's first_focus is step 1.
     let source: "transition" | "cascade" = "transition";
+    // Count of consecutive agents in this chain that reported
+    // `still_visible=true` AND made zero modifications. When it reaches
+    // `quietCap` we stop — the chain is stuck verifying stable content
+    // that the curator already covered, not doing real propagation work.
+    // Any add/remove resets the streak.
+    let quietStreak = 0;
     let reason =
       dir === "backward"
         ? `Backward chain for "${seed.tracked.text}" anchored at frame #${seed.tracked.source_frame}: sweeping earlier frames for lead-in partials.`
@@ -833,7 +1011,7 @@ export async function runCascadeNavigator(
 
     while (true) {
       if (depth > maxDepth) {
-        alog("cascade chain stopped", {
+        logChainStop({
           reason: "max_depth",
           direction: dir,
           tracked_text: seed.tracked.text,
@@ -843,7 +1021,7 @@ export async function runCascadeNavigator(
         return;
       }
       if (totalAgents >= maxAgents) {
-        alog("cascade chain stopped", {
+        logChainStop({
           reason: "max_agents_global",
           direction: dir,
           tracked_text: seed.tracked.text,
@@ -852,7 +1030,7 @@ export async function runCascadeNavigator(
         return;
       }
       if (current < rangeLo || current > rangeHi) {
-        alog("cascade chain stopped", {
+        logChainStop({
           reason: "out_of_range",
           direction: dir,
           tracked_text: seed.tracked.text,
@@ -862,7 +1040,7 @@ export async function runCascadeNavigator(
         return;
       }
       if (claimed[dir].has(current)) {
-        alog("cascade chain stopped", {
+        logChainStop({
           reason: "frame_already_claimed",
           direction: dir,
           tracked_text: seed.tracked.text,
@@ -892,6 +1070,7 @@ export async function runCascadeNavigator(
           spawnReason: reason,
           onEvent,
           abortSignal,
+          runLog,
         });
       } catch (e) {
         aerr(`[${agentId}] aborted`, e);
@@ -901,13 +1080,14 @@ export async function runCascadeNavigator(
       totalAdded += result.added;
       totalRemoved += result.removed;
       totalSteps += result.totalSteps;
+      addUsage(totalUsage, result.usage);
 
       // Chain stop condition: the agent explicitly told us the tracked
       // content is no longer visible at all. Null (agent never called
       // finish) is conservatively treated as "still visible" so we keep
       // looking — but we log it.
       if (result.stillVisible === false) {
-        alog("cascade chain stopped", {
+        logChainStop({
           reason: "tracked_content_gone",
           direction: dir,
           tracked_text: seed.tracked.text,
@@ -924,6 +1104,35 @@ export async function runCascadeNavigator(
           focus: current,
           agent_id: agentId,
         });
+      }
+
+      // Quiet-streak guard: if a contiguous run of agents all report
+      // `still_visible=true` with zero edits, the chain is verifying
+      // stable content that the curator already covered. Bail out.
+      // Any mutation (add or remove) resets the streak so chains that
+      // are still finding work keep propagating.
+      const quiet =
+        result.stillVisible === true &&
+        result.added === 0 &&
+        result.removed === 0;
+      if (quiet) {
+        quietStreak += 1;
+      } else {
+        quietStreak = 0;
+      }
+      if (quietStreak >= quietCap) {
+        logChainStop({
+          reason: "quiet_streak",
+          direction: dir,
+          tracked_text: seed.tracked.text,
+          anchor: seed.tracked.source_frame,
+          focus: current,
+          agent_id: agentId,
+          depth,
+          quiet_streak: quietStreak,
+          quiet_cap: quietCap,
+        });
+        return;
       }
 
       // Advance one step in direction.
@@ -965,5 +1174,6 @@ export async function runCascadeNavigator(
     totalAgents,
     transitions: seeds.length,
     finishSummary: `Cascade: ${totalAgents} agents · +${totalAdded} / -${totalRemoved}`,
+    usage: totalUsage,
   };
 }

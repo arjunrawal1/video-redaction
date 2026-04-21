@@ -54,6 +54,42 @@ function formatBytes(n: number): string {
   return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+function formatCostUSD(n: number): string {
+  if (!Number.isFinite(n)) return "$?";
+  if (n === 0) return "$0.00";
+  if (n < 0.0001) return `$${n.toFixed(8)}`;
+  if (n < 0.01) return `$${n.toFixed(6)}`;
+  if (n < 1) return `$${n.toFixed(4)}`;
+  return `$${n.toFixed(2)}`;
+}
+
+function CostBreakdownLine({
+  label,
+  breakdown,
+}: {
+  label: string;
+  breakdown: Record<string, number | string>;
+}): React.ReactElement {
+  // Render every numeric/`*_usd` field as USD, token counts compactly,
+  // everything else verbatim. Keeps the breakdown honest without
+  // hard-coding a schema that might drift across routes.
+  const parts: string[] = [];
+  for (const [k, v] of Object.entries(breakdown)) {
+    if (typeof v === "number") {
+      if (k.endsWith("_usd")) parts.push(`${k.replace("_usd", "")}=${formatCostUSD(v)}`);
+      else if (k.endsWith("_tokens")) parts.push(`${k}=${v.toLocaleString()}`);
+      else parts.push(`${k}=${v}`);
+    } else {
+      parts.push(`${k}=${v}`);
+    }
+  }
+  return (
+    <div className="font-mono text-[10px] text-muted-foreground">
+      <span className="text-foreground">{label}</span> · {parts.join(" · ")}
+    </div>
+  );
+}
+
 function formatToolCall(name: string, input: unknown): string {
   if (!input || typeof input !== "object") return `${name}(?)`;
   const i = input as Record<string, unknown>;
@@ -356,6 +392,34 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
     Array<{ id: number; step: number; label: string }>
   >([]);
 
+  // Running cost tracker. Updated live from server `cost_update` events
+  // during both detect and navigate routes, sealed by `cost_final`.
+  type CostState = {
+    detect_running_usd: number;
+    detect_final_usd: number | null;
+    detect_breakdown: Record<string, number | string> | null;
+    detect_log_path: string | null;
+    navigate_running_usd: number;
+    navigate_final_usd: number | null;
+    navigate_breakdown: Record<string, number | string> | null;
+    navigate_log_path: string | null;
+    last_call_phase: string | null;
+    last_call_usd: number;
+  };
+  const emptyCost: CostState = {
+    detect_running_usd: 0,
+    detect_final_usd: null,
+    detect_breakdown: null,
+    detect_log_path: null,
+    navigate_running_usd: 0,
+    navigate_final_usd: null,
+    navigate_breakdown: null,
+    navigate_log_path: null,
+    last_call_phase: null,
+    last_call_usd: 0,
+  };
+  const [cost, setCost] = useState<CostState>(emptyCost);
+
   // Full-video export. The blob URL stays alive as the `href` of the
   // download link; we revoke it on replace/unmount to avoid leaking.
   const [exporting, setExporting] = useState(false);
@@ -500,6 +564,7 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
       setBacktrackTouched([]);
       setForwardStats(null);
       setForwardTouched([]);
+      setCost(emptyCost);
       // A new detection run invalidates any previously exported video.
       setExporting(false);
       setExportError(null);
@@ -538,6 +603,27 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
                 from: event.frame_from,
                 to: event.frame_to,
               });
+              if (event.run_log_path) {
+                setCost((prev) => ({
+                  ...prev,
+                  detect_log_path: event.run_log_path ?? null,
+                }));
+              }
+            } else if (event.type === "cost_update") {
+              setCost((prev) => ({
+                ...prev,
+                detect_running_usd: event.running_usd,
+                last_call_phase: event.phase,
+                last_call_usd: event.call_usd,
+              }));
+            } else if (event.type === "cost_final") {
+              setCost((prev) => ({
+                ...prev,
+                detect_final_usd: event.total_usd,
+                detect_running_usd: event.total_usd,
+                detect_breakdown: event.breakdown,
+                detect_log_path: event.run_log_path ?? prev.detect_log_path,
+              }));
             } else if (event.type === "frame") {
               setDetections((prev) => ({
                 ...prev,
@@ -555,6 +641,29 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
               setRunProgress((p) =>
                 p ? { ...p, processed: p.processed + 1 } : p,
               );
+            } else if (event.type === "link") {
+              // Teamwork phase-1.5 linker output arrives after the
+              // matching `frame` event. Stamp `track_id` onto each
+              // box by position — the server guarantees order
+              // alignment with the boxes it emitted earlier.
+              setDetections((prev) => {
+                const existing = prev[event.index];
+                if (!existing) return prev;
+                const ids = event.track_ids;
+                const nextBoxes = existing.detection.boxes.map((b, i) =>
+                  ids[i] != null ? { ...b, track_id: ids[i] } : b,
+                );
+                return {
+                  ...prev,
+                  [event.index]: {
+                    ...existing,
+                    detection: {
+                      ...existing.detection,
+                      boxes: nextBoxes,
+                    },
+                  },
+                };
+              });
             } else if (event.type === "error") {
               setDetectError(event.message);
             }
@@ -585,7 +694,29 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
             q,
             { frameFrom: from, frameTo: to, engine: currentEngine },
             (event) => {
-              if (event.type === "frame_update") {
+              if (event.type === "start") {
+                if (event.run_log_path) {
+                  setCost((prev) => ({
+                    ...prev,
+                    navigate_log_path: event.run_log_path ?? null,
+                  }));
+                }
+              } else if (event.type === "cost_update") {
+                setCost((prev) => ({
+                  ...prev,
+                  navigate_running_usd: event.running_usd,
+                  last_call_phase: event.phase,
+                  last_call_usd: event.call_usd,
+                }));
+              } else if (event.type === "cost_final") {
+                setCost((prev) => ({
+                  ...prev,
+                  navigate_final_usd: event.total_usd,
+                  navigate_running_usd: event.total_usd,
+                  navigate_breakdown: event.breakdown,
+                  navigate_log_path: event.run_log_path ?? prev.navigate_log_path,
+                }));
+              } else if (event.type === "frame_update") {
                 setDetections((prev) => {
                   const existing = prev[event.index];
                   if (event.action === "add") {
@@ -945,6 +1076,10 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
         y: b.y,
         w: b.w,
         h: b.h,
+        // Forwarded so the backend can tween between consecutive
+        // kept frames that share a track. Boxes without a track_id
+        // (OCR engine, or navigator-added fix boxes) render statically.
+        track_id: b.track_id,
       }));
     }
 
@@ -1404,6 +1539,77 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
                 </li>
               ))}
             </ul>
+          )}
+        </div>
+      )}
+
+      {/* Cost tracker — live running total during detect/navigate, sealed
+          with final authoritative numbers + run log paths after each phase
+          completes. Hidden until the first `cost_update` event arrives. */}
+      {(cost.detect_running_usd > 0 ||
+        cost.navigate_running_usd > 0 ||
+        cost.detect_log_path ||
+        cost.navigate_log_path) && (
+        <div className="flex flex-col gap-1 rounded-lg border border-border bg-background/60 p-2 text-xs">
+          <div className="flex items-center justify-between">
+            <span className="text-muted-foreground">Running cost</span>
+            <span className="font-mono text-foreground">
+              {formatCostUSD(
+                cost.detect_running_usd + cost.navigate_running_usd,
+              )}
+            </span>
+          </div>
+          <div className="grid grid-cols-2 gap-x-3 font-mono text-[10px] text-muted-foreground">
+            <span>
+              detect{" "}
+              <span className="text-foreground">
+                {formatCostUSD(cost.detect_running_usd)}
+              </span>
+              {cost.detect_final_usd != null && (
+                <span className="ml-1 text-primary">✓</span>
+              )}
+            </span>
+            <span>
+              navigate{" "}
+              <span className="text-foreground">
+                {formatCostUSD(cost.navigate_running_usd)}
+              </span>
+              {cost.navigate_final_usd != null && (
+                <span className="ml-1 text-primary">✓</span>
+              )}
+            </span>
+          </div>
+          {cost.last_call_phase && (
+            <div className="font-mono text-[10px] text-muted-foreground">
+              last call · {cost.last_call_phase} · +
+              {formatCostUSD(cost.last_call_usd)}
+            </div>
+          )}
+          {(cost.detect_log_path || cost.navigate_log_path) && (
+            <div className="mt-1 flex flex-col gap-0.5 border-t border-border/50 pt-1 font-mono text-[10px] text-muted-foreground">
+              {cost.detect_log_path && (
+                <span className="truncate" title={cost.detect_log_path}>
+                  detect log: {cost.detect_log_path}
+                </span>
+              )}
+              {cost.navigate_log_path && (
+                <span className="truncate" title={cost.navigate_log_path}>
+                  navigate log: {cost.navigate_log_path}
+                </span>
+              )}
+            </div>
+          )}
+          {cost.detect_final_usd != null && cost.detect_breakdown && (
+            <CostBreakdownLine
+              label="detect"
+              breakdown={cost.detect_breakdown}
+            />
+          )}
+          {cost.navigate_final_usd != null && cost.navigate_breakdown && (
+            <CostBreakdownLine
+              label="navigate"
+              breakdown={cost.navigate_breakdown}
+            />
           )}
         </div>
       )}

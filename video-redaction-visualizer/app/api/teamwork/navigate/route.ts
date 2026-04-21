@@ -21,14 +21,23 @@ import {
   type NavHit,
   type NavigatorEvent,
 } from "@/lib/server/agentic-navigator";
+import {
+  addUsage,
+  emptyUsage,
+  formatTokens,
+  formatUSD,
+  geminiCost,
+  type AggregateUsage,
+} from "@/lib/server/cost";
 import { fetchDeduplicatedFramesServer } from "@/lib/server/frames";
 import { getEntry } from "@/lib/server/gemini-cache";
-import { agenticNavMode } from "@/lib/server/openrouter";
+import { agenticModelId, agenticNavMode } from "@/lib/server/openrouter";
 import {
   ndjsonStreamResponse,
   normalizeQuery,
   readFormInputs,
 } from "@/lib/server/route-helpers";
+import { openRunLog } from "@/lib/server/run-log";
 
 export const runtime = "nodejs";
 export const maxDuration = 600;
@@ -62,6 +71,16 @@ export async function POST(req: Request): Promise<Response> {
   const lo = frameFrom;
   const hi = frameTo;
 
+  const runLog = openRunLog("navigate", {
+    video_hash: framesRes.videoHash,
+    query,
+    query_norm: qNorm,
+    frame_from: lo,
+    frame_to: hi,
+    model: agenticModelId(),
+    mode: agenticNavMode(),
+  });
+
   return ndjsonStreamResponse(async ({ emit, error }) => {
     alog("navigate route start", {
       video_hash: framesRes.videoHash,
@@ -69,6 +88,7 @@ export async function POST(req: Request): Promise<Response> {
       query_norm: qNorm,
       frame_from: lo,
       frame_to: hi,
+      run_log_path: runLog.path,
     });
 
     emit({
@@ -78,8 +98,10 @@ export async function POST(req: Request): Promise<Response> {
       frame_from: lo,
       frame_to: hi,
       total_frames: hi - lo + 1,
+      run_log_path: runLog.path,
     });
     if (!qNorm) {
+      await runLog.close();
       emit({ type: "done", added_boxes: 0, removed_boxes: 0, total_steps: 0 });
       return;
     }
@@ -130,6 +152,35 @@ export async function POST(req: Request): Promise<Response> {
       return;
     }
 
+    // Running navigator cost, updated incrementally as agents finish.
+    // We don't know per-agent usage from the event payload (agent_end
+    // doesn't carry usage — only the final result does), so for the
+    // cascade mode we piggy-back the per-agent cost off the cascade's
+    // aggregate at finish time. For a live running counter during the
+    // run, we synthesize updates from the cumulative cost that the
+    // cascade reports via its event stream. See below for the approach.
+    const navRunningUsage: AggregateUsage = emptyUsage();
+    let runningUSD = 0;
+    // Agent-scoped cumulative — tracks the latest stipulated values so
+    // we emit monotonically increasing running_usd.
+    const emitCost = (phase: string, callUsd: number): void => {
+      runningUSD += callUsd;
+      const bill = geminiCost(agenticModelId(), navRunningUsage);
+      emit({
+        type: "cost_update",
+        phase,
+        call_usd: callUsd,
+        running_usd: runningUSD,
+        breakdown: {
+          navigator_calls: bill.callCount,
+          navigator_usd: bill.totalUSD,
+          navigator_input_tokens: bill.inputTokens,
+          navigator_output_tokens: bill.outputTokens,
+          navigator_cached_input_tokens: bill.cachedInputTokens,
+        },
+      });
+    };
+
     // Single NDJSON emitter — handles every NavigatorEvent variant the
     // cascade or single-agent navigator can produce. Keeping one forwarder
     // makes the two modes observationally identical from the client's
@@ -155,7 +206,12 @@ export async function POST(req: Request): Promise<Response> {
             removed: ev.removed,
             total_steps: ev.total_steps,
             finish_summary: ev.finish_summary,
+            cost_usd: ev.cost_usd ?? 0,
           });
+          if (ev.usage) addUsage(navRunningUsage, ev.usage);
+          if (ev.cost_usd != null && ev.cost_usd > 0) {
+            emitCost(`agent:${ev.agent_id}`, ev.cost_usd);
+          }
           return;
         case "frame_update":
           emit({
@@ -172,6 +228,12 @@ export async function POST(req: Request): Promise<Response> {
               label: ev.hit.label,
               hit_id: ev.hit.hit_id,
               origin: ev.hit.origin,
+              // Populated by resolveFixTrackId() when the navigator
+              // added this box — either an inherited neighbor id (so
+              // interpolation chains through) or a fresh `f:<hit_id>`
+              // for genuinely novel redactions. Undefined on the
+              // remove path (client reads hit_id there anyway).
+              track_id: ev.hit.track_id,
             },
             reason: ev.reason ?? null,
             agent_id: ev.agent_id ?? null,
@@ -221,27 +283,56 @@ export async function POST(req: Request): Promise<Response> {
       let removed = 0;
       let totalSteps = 0;
       let finishSummary: string | null = null;
+      const runUsage: AggregateUsage = emptyUsage();
 
       if (mode === "cascade") {
         const result = await runCascadeNavigator({
           query: qNorm,
           frames: navFrames,
           onEvent: forward,
+          runLog,
         });
         added = result.added;
         removed = result.removed;
         totalSteps = result.totalSteps;
         finishSummary = result.finishSummary;
+        // Cascade already aggregated per-agent usage internally.
+        runUsage.inputTokens += result.usage.inputTokens;
+        runUsage.outputTokens += result.usage.outputTokens;
+        runUsage.reasoningTokens += result.usage.reasoningTokens;
+        runUsage.cachedInputTokens += result.usage.cachedInputTokens;
+        runUsage.callCount += result.usage.callCount;
       } else {
         const result = await runNavigator({
           query: qNorm,
           frames: navFrames,
           onEvent: forward,
+          runLog,
         });
         added = result.added;
         removed = result.removed;
         totalSteps = result.totalSteps;
         finishSummary = result.finishSummary;
+        addUsage(runUsage, result.usage);
+        // Single-agent navigator: emit one cost_update post-hoc so the
+        // UI still sees a non-zero running total in this mode.
+        if (result.usage) {
+          const bill = geminiCost(agenticModelId(), {
+            inputTokens: result.usage.inputTokens ?? 0,
+            outputTokens: result.usage.outputTokens ?? 0,
+            reasoningTokens:
+              result.usage.outputTokenDetails?.reasoningTokens ?? 0,
+            cachedInputTokens:
+              result.usage.inputTokenDetails?.cacheReadTokens ?? 0,
+            callCount: 1,
+          });
+          navRunningUsage.inputTokens += bill.inputTokens;
+          navRunningUsage.outputTokens += bill.outputTokens;
+          navRunningUsage.reasoningTokens += bill.reasoningTokens;
+          navRunningUsage.cachedInputTokens += bill.cachedInputTokens;
+          navRunningUsage.callCount += bill.callCount;
+          emitCost("navigator", bill.totalUSD);
+        }
       }
 
       // Mirror mutations back into the shared cache so a downstream
@@ -253,13 +344,64 @@ export async function POST(req: Request): Promise<Response> {
         f.matched = nf.hits.map(({ hit_id: _hit_id, ...rest }) => rest);
       }
 
-      alog("navigate route done", {
+      // ---- Cost summary ---------------------------------------------
+      const bill = geminiCost(agenticModelId(), runUsage);
+      alog("navigate route cost", {
         mode,
         added_boxes: added,
         removed_boxes: removed,
         total_steps: totalSteps,
         finish_summary: finishSummary,
+        // --- Gemini navigator/cascade ---
+        navigator_model: bill.model,
+        navigator_calls: bill.callCount,
+        navigator_input_tokens: bill.inputTokens,
+        navigator_output_tokens: bill.outputTokens,
+        navigator_reasoning_tokens: bill.reasoningTokens,
+        navigator_cached_input_tokens: bill.cachedInputTokens,
+        navigator_input_usd: bill.inputUSD,
+        navigator_output_usd: bill.outputUSD,
+        navigator_total_usd: bill.totalUSD,
+        navigator_tier: bill.tier,
       });
+      alog(
+        `navigate route done — ${mode} · ${bill.callCount} Gemini calls ` +
+          `(${formatTokens(bill.inputTokens)} in / ${formatTokens(bill.outputTokens)} out` +
+          (bill.reasoningTokens > 0
+            ? ` · ${formatTokens(bill.reasoningTokens)} reasoning`
+            : "") +
+          `) @ ${formatUSD(bill.totalUSD)}`,
+      );
+
+      emit({
+        type: "cost_final",
+        phase: "navigate",
+        total_usd: bill.totalUSD,
+        breakdown: {
+          navigator_calls: bill.callCount,
+          navigator_input_tokens: bill.inputTokens,
+          navigator_output_tokens: bill.outputTokens,
+          navigator_reasoning_tokens: bill.reasoningTokens,
+          navigator_cached_input_tokens: bill.cachedInputTokens,
+          navigator_usd: bill.totalUSD,
+          navigator_tier: bill.tier,
+        },
+        run_log_path: runLog.path,
+      });
+
+      runLog.write({
+        kind: "run_end",
+        mode,
+        added_boxes: added,
+        removed_boxes: removed,
+        total_steps: totalSteps,
+        finish_summary: finishSummary,
+        navigator_calls: bill.callCount,
+        navigator_input_tokens: bill.inputTokens,
+        navigator_output_tokens: bill.outputTokens,
+        navigator_total_usd: bill.totalUSD,
+      });
+      await runLog.close();
 
       emit({
         type: "done",
@@ -269,6 +411,11 @@ export async function POST(req: Request): Promise<Response> {
       });
     } catch (e) {
       aerr("navigate route navigator threw", e);
+      runLog.write({
+        kind: "run_error",
+        error: e instanceof Error ? e.message : String(e),
+      });
+      await runLog.close();
       error(
         "Navigator failed: " + (e instanceof Error ? e.message : String(e)),
       );

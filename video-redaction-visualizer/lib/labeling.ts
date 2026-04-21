@@ -1,13 +1,23 @@
 // Cross-frame hit labeling.
 //
 // Walks frames in ascending order and assigns each hit a stable A, B, C, ...
-// identity. A hit in frame k inherits its label from a hit in frame k-1 when
-// both (a) their texts match (normalized equality, substring either way, or
-// Levenshtein similarity >= _TEXT_THRESHOLD) AND (b) their normalized-
-// coordinate centers are within _LINK_DIST. Otherwise it gets the next
-// unused letter. This mirrors the correspondence predicate used by the
-// backend backtrack pass so that backtrack chains -- which are literally
-// the same real-world text across frames -- collapse to one identity.
+// identity. Two paths, in order of preference:
+//
+//   1. Server-assigned `track_id` (teamwork engine's phase-1.5 linker):
+//      if every box in a frame carries a `track_id`, we use those as the
+//      chain identity and letters are just a first-seen dense encoding
+//      (`t3` → `A` the first time it appears, then stays `A` forever).
+//      Gemini already decided correspondence, we just render it.
+//
+//   2. Geometric fallback (OCR engine, pre-linker state, mixed frames):
+//      a hit in frame k inherits its label from a hit in frame k-1 when
+//      both (a) their texts match (normalized equality, substring
+//      either way, or Levenshtein similarity >= _TEXT_THRESHOLD) AND
+//      (b) their normalized-coordinate centers are within _LINK_DIST.
+//      Otherwise it gets the next unused letter. This mirrors the
+//      correspondence predicate used by the backend backtrack pass so
+//      that backtrack chains -- which are literally the same real-world
+//      text across frames -- collapse to one identity.
 
 import type { DetectionBox } from "@/lib/frames-api";
 
@@ -109,6 +119,17 @@ export function assignLabels(
   let nextLabelIdx = 0;
   let prevLabeled: PrevLabeled[] = [];
 
+  // First-seen track_id → letter mapping. Shared across the whole range
+  // so the same server identity always maps to the same letter on screen.
+  const labelByTrack = new Map<string, string>();
+  const labelForTrack = (trackId: string): string => {
+    const hit = labelByTrack.get(trackId);
+    if (hit) return hit;
+    const fresh = toLetterLabel(nextLabelIdx++);
+    labelByTrack.set(trackId, fresh);
+    return fresh;
+  };
+
   for (let k = 1; k <= totalFrames; k++) {
     const entry = framesByIndex[k];
     if (!entry) {
@@ -118,12 +139,40 @@ export function assignLabels(
       continue;
     }
 
+    // Fast path: server gave us a track_id on every box → render directly.
+    // We still append to prevLabeled so a later frame that loses its
+    // track_ids (e.g. navigator added a `fix` box after the linker ran)
+    // can fall back cleanly to geometric matching against the last frame.
+    const allTracked =
+      entry.boxes.length > 0 &&
+      entry.boxes.every((b) => typeof b.track_id === "string" && b.track_id);
+    if (allTracked) {
+      const labelsForFrame = entry.boxes.map((b) =>
+        labelForTrack(b.track_id as string),
+      );
+      out[k] = labelsForFrame;
+      prevLabeled = entry.boxes.map((b, i) => {
+        const { cx, cy } = centerNormalized(b, entry.width, entry.height);
+        return { cx, cy, text: b.text, label: labelsForFrame[i] };
+      });
+      continue;
+    }
+
     const labelsForFrame: string[] = [];
     const nextPrev: PrevLabeled[] = [];
     const claimed = new Set<number>();
 
     for (const box of entry.boxes) {
       const { cx, cy } = centerNormalized(box, entry.width, entry.height);
+
+      // If this specific box carries a track_id even though the frame
+      // as a whole doesn't, still prefer the server identity for it.
+      if (typeof box.track_id === "string" && box.track_id) {
+        const label = labelForTrack(box.track_id);
+        labelsForFrame.push(label);
+        nextPrev.push({ cx, cy, text: box.text, label });
+        continue;
+      }
 
       // Pick the closest prev hit that satisfies both predicates; first-come
       // wins if distances tie. One-to-one matching via `claimed` prevents a

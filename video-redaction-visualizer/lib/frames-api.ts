@@ -44,6 +44,15 @@ export type DetectionBox = {
   // produce labels server-side (Gemini). OCR leaves this undefined and the
   // client falls back to the deterministic assignLabels pass.
   label?: string;
+  // Cross-frame identity assigned by the teamwork phase-1.5 linker
+  // (lib/server/agentic-linker.ts). Boxes that share a track_id refer
+  // to the same real-world redaction across adjacent scanned frames,
+  // so the UI can safely interpolate (tween) their coordinates for
+  // smooth rendering between keyframes. Undefined on OCR / Gemini
+  // engines and on teamwork boxes that arrived before the linker
+  // event did; the existing assignLabels fallback still produces
+  // letter labels in that case.
+  track_id?: string;
 };
 
 export type DetectionFrame = {
@@ -61,6 +70,45 @@ export type DetectStartEvent = {
   frame_to: number;
   frame_indices: number[];
   total: number;
+  /** Absolute path of the per-run NDJSON log file (empty if disabled). */
+  run_log_path?: string;
+};
+
+/**
+ * Streamed incrementally after every priced event (OCR pages known up
+ * front, each curator call, each linker call, each focused-agent call).
+ * The client can render a live "Running: $X.XXXX" counter by listening
+ * for these and using `running_usd` as the authoritative cumulative.
+ */
+export type CostUpdateEvent = {
+  type: "cost_update";
+  /** Which pipeline stage produced this update. */
+  phase: string;
+  /** Optional identifiers for the specific call. */
+  frame_index?: number;
+  frame_pair?: [number, number];
+  /** USD spent by this single call (delta). */
+  call_usd: number;
+  /** Cumulative USD across the entire route invocation so far. */
+  running_usd: number;
+  /** Coarse breakdown of where the running total came from. */
+  breakdown: Record<string, number | string>;
+};
+
+/**
+ * Emitted once at the end of a detect / navigate invocation with the
+ * authoritative final total. Clients should replace their running
+ * estimate with this number when it arrives.
+ */
+export type CostFinalEvent = {
+  type: "cost_final";
+  /** "detect" | "navigate" — which route produced this summary. */
+  phase: string;
+  total_usd: number;
+  breakdown: Record<string, number | string>;
+  elapsed_ms?: number;
+  /** Absolute path to the per-run NDJSON log for this route invocation. */
+  run_log_path?: string;
 };
 
 export type DetectFrameEvent = {
@@ -88,11 +136,51 @@ export type DetectErrorEvent = {
   message: string;
 };
 
+/**
+ * Teamwork phase-1.5: per-frame linker output, emitted after every
+ * curator `frame` event in the stream has landed. One event per
+ * scanned frame (including frames with zero boxes, which emit an empty
+ * `track_ids`). The array is aligned with the `boxes` array from the
+ * earlier `frame` event for the same `index` — position i in
+ * `track_ids` is the identity of `boxes[i]`.
+ *
+ * `links` is a debug-friendly parallel array whose i'th entry says
+ * which previous-frame box index (or null for a newly-appearing track)
+ * this box inherited its identity from. Safe to ignore on the client
+ * unless you're rendering a link-decisions debug panel.
+ */
+export type DetectLinkEvent = {
+  type: "link";
+  /** 1-indexed frame number in the original deduplicated sequence. */
+  index: number;
+  /**
+   * Identity assigned to each box in the frame, aligned with the order
+   * emitted in the prior `frame` event. Minted server-side as `t{n}`.
+   * Empty when the frame has no boxes.
+   */
+  track_ids: string[];
+  /**
+   * Per-box decision narrative. `prev_b_index` identifies which box in
+   * the immediately-preceding scanned frame this track was inherited
+   * from; null means "new track that first appears here".
+   */
+  links: Array<{
+    prev_index: number | null;
+    prev_b_index: number | null;
+    reason: string | null;
+    /** True if this frame's decision used the deterministic fallback. */
+    fallback?: boolean;
+  }>;
+};
+
 export type DetectEvent =
   | DetectStartEvent
   | DetectFrameEvent
+  | DetectLinkEvent
   | DetectDoneEvent
-  | DetectErrorEvent;
+  | DetectErrorEvent
+  | CostUpdateEvent
+  | CostFinalEvent;
 
 export type StreamDetectOptions = {
   frameFrom?: number;
@@ -347,6 +435,30 @@ export type NavigateStartEvent = {
   frame_from: number;
   frame_to: number;
   total_frames: number;
+  run_log_path?: string;
+};
+
+/** Cascade-only: fires when a focused agent is about to start. */
+export type NavigateAgentStartEvent = {
+  type: "agent_start";
+  agent_id: string;
+  focus_frame: number;
+  source: "transition" | "cascade";
+  parent_agent_id: string | null;
+  reason: string;
+};
+
+/** Cascade-only: fires when a focused agent finishes. Carries the USD
+ *  cost for the single generateText call that ran this agent. */
+export type NavigateAgentEndEvent = {
+  type: "agent_end";
+  agent_id: string;
+  focus_frame: number;
+  added: number;
+  removed: number;
+  total_steps: number;
+  finish_summary: string | null;
+  cost_usd?: number;
 };
 
 export type NavigateToolCallEvent = {
@@ -354,6 +466,7 @@ export type NavigateToolCallEvent = {
   step: number;
   name: string;
   input: unknown;
+  agent_id?: string | null;
 };
 
 export type NavigateToolResultEvent = {
@@ -361,12 +474,14 @@ export type NavigateToolResultEvent = {
   step: number;
   name: string;
   summary: string;
+  agent_id?: string | null;
 };
 
 export type NavigateModelTextEvent = {
   type: "model_text";
   step: number;
   text: string;
+  agent_id?: string | null;
 };
 
 export type NavigateFrameUpdateEvent = {
@@ -374,6 +489,8 @@ export type NavigateFrameUpdateEvent = {
   index: number;
   action: "add" | "remove";
   box: DetectionBox & { hit_id: string };
+  reason?: string | null;
+  agent_id?: string | null;
 };
 
 export type NavigateFinishEvent = {
@@ -396,13 +513,17 @@ export type NavigateErrorEvent = {
 
 export type NavigateEvent =
   | NavigateStartEvent
+  | NavigateAgentStartEvent
+  | NavigateAgentEndEvent
   | NavigateToolCallEvent
   | NavigateToolResultEvent
   | NavigateModelTextEvent
   | NavigateFrameUpdateEvent
   | NavigateFinishEvent
   | NavigateDoneEvent
-  | NavigateErrorEvent;
+  | NavigateErrorEvent
+  | CostUpdateEvent
+  | CostFinalEvent;
 
 export async function streamNavigate(
   file: File,
@@ -431,6 +552,15 @@ export type ExportBoxRect = {
   y: number;
   w: number;
   h: number;
+  /**
+   * Cross-frame identity from the teamwork phase-1.5 linker. When two
+   * boxes in consecutive kept frames share the same `track_id`, the
+   * exporter interpolates the drawbox coords linearly across the
+   * time window between them so the redaction tweens smoothly instead
+   * of jumping at each keyframe. Undefined → the exporter treats the
+   * box as static across its keyframe window (legacy behavior).
+   */
+  track_id?: string;
 };
 
 export type ExportStyle = {

@@ -20,14 +20,17 @@
 //   - Loop runs until the model stops calling tools OR `finish` is called
 //     OR the safety step ceiling is hit.
 
-import { generateText, stepCountIs, tool } from "ai";
+import { generateText, stepCountIs, tool, type LanguageModelUsage } from "ai";
 import { z } from "zod";
 import { aerr, alog } from "./agentic-log";
+import { geminiCost } from "./cost";
+import { resolveFixTrackId } from "./linker-fallback";
 import {
   BOX_FORMAT_NOTE,
   agenticBuiltinTools,
   agenticCodeExecutionEnabled,
   agenticLanguageModel,
+  agenticModelId,
   agenticModelSlug,
   agenticNavigatorMaxSteps,
   agenticProviderOptions,
@@ -36,6 +39,7 @@ import {
   pixelBoxToNormalizedBbox,
   type ServerBox,
 } from "./openrouter";
+import { compact, type RunLog } from "./run-log";
 
 // Subset of the Textract DetectDocumentText Block shape we actually read
 // when the navigator asks for raw OCR. Keeps the `get_ocr_text` tool
@@ -90,6 +94,11 @@ export type NavigatorEvent =
       removed: number;
       total_steps: number;
       finish_summary: string | null;
+      /** Raw AI-SDK usage for this agent's single generateText call. */
+      usage?: LanguageModelUsage | null;
+      /** Pre-computed USD cost for this agent's call, using the
+       *  agentic-pipeline model pricing. */
+      cost_usd?: number;
     }
   | {
       type: "tool_call";
@@ -188,15 +197,47 @@ export async function runNavigator(opts: {
   frames: NavFrameState[];
   onEvent: (ev: NavigatorEvent) => void;
   abortSignal?: AbortSignal;
+  runLog?: RunLog | null;
 }): Promise<{
   totalSteps: number;
   added: number;
   removed: number;
   finishSummary: string | null;
+  usage: LanguageModelUsage | null;
 }> {
-  const { query, frames, onEvent, abortSignal } = opts;
+  const { query, frames, onEvent, abortSignal, runLog } = opts;
   const frameByIndex = new Map<number, NavFrameState>();
   for (const f of frames) frameByIndex.set(f.index, f);
+
+  // Mirror of cascade's trackIdForFix. Unlike the focused-agent variant,
+  // the single-agent navigator can target any frame in the range so we
+  // parametrize by frame_index rather than closing over a focus.
+  const trackIdForFix = (args: {
+    hit: NavHit;
+    frame: NavFrameState;
+  }): string => {
+    const { hit, frame } = args;
+    const prev = frameByIndex.get(frame.index - 1);
+    const next = frameByIndex.get(frame.index + 1);
+    const claimed = new Set<string>();
+    for (const h of frame.hits) {
+      if (h.track_id) claimed.add(h.track_id);
+    }
+    return resolveFixTrackId({
+      frameIndex: frame.index,
+      hitId: hit.hit_id,
+      newBox: hit,
+      newFrameWidth: frame.width,
+      newFrameHeight: frame.height,
+      prevFrame: prev
+        ? { hits: prev.hits, width: prev.width, height: prev.height }
+        : null,
+      nextFrame: next
+        ? { hits: next.hits, width: next.width, height: next.height }
+        : null,
+      claimedOnCurrentFrame: claimed,
+    });
+  };
 
   let added = 0;
   let removed = 0;
@@ -311,11 +352,13 @@ export async function runNavigator(opts: {
         hit_id: mintHitId(),
         reason: reason ?? undefined,
       };
+      hit.track_id = trackIdForFix({ hit, frame: f });
       f.hits.push(hit);
       added += 1;
       alog(`tool add_box applied`, {
         frame_index,
         hit_id: hit.hit_id,
+        track_id: hit.track_id,
         pixel_box: { x: hit.x, y: hit.y, w: hit.w, h: hit.h },
       });
       onEvent({
@@ -328,6 +371,7 @@ export async function runNavigator(opts: {
       return {
         ok: true as const,
         hit_id: hit.hit_id,
+        track_id: hit.track_id,
         pixel_box: { x: hit.x, y: hit.y, w: hit.w, h: hit.h },
       };
     },
@@ -401,11 +445,13 @@ export async function runNavigator(opts: {
         hit_id: mintHitId(),
         reason: reason ?? undefined,
       };
+      hit.track_id = trackIdForFix({ hit, frame: f });
       f.hits.push(hit);
       added += 1;
       alog(`tool adopt_ocr_box applied`, {
         frame_index,
         hit_id: hit.hit_id,
+        track_id: hit.track_id,
         pixel_box: { x: hit.x, y: hit.y, w: hit.w, h: hit.h },
         source_ocr_text: src.text,
       });
@@ -419,6 +465,7 @@ export async function runNavigator(opts: {
       return {
         ok: true as const,
         hit_id: hit.hit_id,
+        track_id: hit.track_id,
         pixel_box: { x: hit.x, y: hit.y, w: hit.w, h: hit.h },
       };
     },
@@ -546,6 +593,7 @@ export async function runNavigator(opts: {
     .join("\n");
 
   const model = agenticLanguageModel();
+  const systemPrompt = system();
 
   alog("navigator start", {
     model: agenticModelSlug(),
@@ -556,7 +604,20 @@ export async function runNavigator(opts: {
     frames_in_range: frames.length,
     total_phase1_hits: frames.reduce((s, f) => s + f.hits.length, 0),
     total_ocr_candidates: frames.reduce((s, f) => s + f.ocrBoxes.length, 0),
-    system_prompt: system(),
+    system_prompt: systemPrompt,
+    initial_user_message: initialText,
+  });
+  runLog?.write({
+    kind: "navigator_start",
+    model: agenticModelSlug(),
+    max_steps: agenticNavigatorMaxSteps(),
+    thinking_level: agenticThinkingLevel(),
+    code_execution: agenticCodeExecutionEnabled(),
+    query,
+    frames_in_range: frames.length,
+    total_phase1_hits: frames.reduce((s, f) => s + f.hits.length, 0),
+    total_ocr_candidates: frames.reduce((s, f) => s + f.ocrBoxes.length, 0),
+    system_prompt: systemPrompt,
     initial_user_message: initialText,
   });
 
@@ -566,7 +627,7 @@ export async function runNavigator(opts: {
     result = await generateText({
       model,
       tools,
-      system: system(),
+      system: systemPrompt,
       providerOptions: agenticProviderOptions(),
       messages: [{ role: "user", content: [{ type: "text", text: initialText }] }],
       stopWhen: stepCountIs(agenticNavigatorMaxSteps()),
@@ -590,6 +651,24 @@ export async function runNavigator(opts: {
             toolCallId: r.toolCallId,
             output: r.output,
           })),
+        });
+        runLog?.write({
+          kind: "navigator_step",
+          step: stepNum,
+          finish_reason: step.finishReason,
+          text: step.text ?? "",
+          reasoning_text: step.reasoningText ?? null,
+          tool_calls: step.toolCalls?.map((c) => ({
+            name: c.toolName,
+            id: c.toolCallId,
+            input: compact(c.input),
+          })),
+          tool_results: step.toolResults?.map((r) => ({
+            name: r.toolName,
+            id: r.toolCallId,
+            output: compact(r.output),
+          })),
+          usage: step.usage,
         });
         for (const call of step.toolCalls ?? []) {
           onEvent({
@@ -615,10 +694,21 @@ export async function runNavigator(opts: {
     });
   } catch (e) {
     aerr("navigator generateText failed", e);
+    runLog?.write({
+      kind: "navigator_error",
+      error: e instanceof Error ? e.message : String(e),
+    });
     throw e;
   }
 
   const elapsed = Date.now() - t0;
+  const finalCost = geminiCost(agenticModelId(), {
+    inputTokens: result.usage?.inputTokens ?? 0,
+    outputTokens: result.usage?.outputTokens ?? 0,
+    reasoningTokens: result.usage?.outputTokenDetails?.reasoningTokens ?? 0,
+    cachedInputTokens: result.usage?.inputTokenDetails?.cacheReadTokens ?? 0,
+    callCount: 1,
+  });
   alog(`navigator finished (${elapsed}ms)`, {
     total_steps: steps,
     added,
@@ -628,6 +718,21 @@ export async function runNavigator(opts: {
     finalUsage: result.usage,
     finalText: result.text,
     warnings: result.warnings,
+    cost_usd: finalCost.totalUSD,
+  });
+  runLog?.write({
+    kind: "navigator_end",
+    total_steps: steps,
+    added,
+    removed,
+    finish_summary: finishSummary,
+    finish_reason: result.finishReason,
+    usage: result.usage,
+    warnings: result.warnings,
+    elapsed_ms: elapsed,
+    cost_usd: finalCost.totalUSD,
+    input_usd: finalCost.inputUSD,
+    output_usd: finalCost.outputUSD,
   });
 
   onEvent({
@@ -636,7 +741,13 @@ export async function runNavigator(opts: {
     total_steps: steps,
   });
 
-  return { totalSteps: steps, added, removed, finishSummary };
+  return {
+    totalSteps: steps,
+    added,
+    removed,
+    finishSummary,
+    usage: result.usage ?? null,
+  };
 }
 
 function summarizeToolResult(name: string, output: unknown): string {

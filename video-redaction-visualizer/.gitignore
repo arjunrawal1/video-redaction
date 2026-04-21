@@ -39,3 +39,7 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# Per-run JSONL logs written by lib/server/run-log.ts
+/logs/
+

@@ -26,6 +26,16 @@ export type ServerBox = {
   score: number;
   label?: string;
   origin?: "backtrack" | "forward" | "fix";
+  /**
+   * Cross-frame identity assigned by the agentic linker (phase-1.5). Two
+   * boxes share a `track_id` iff Gemini judged them to be the same
+   * real-world redaction across consecutive scanned frames. The UI uses
+   * this to interpolate (tween) box coordinates between keyframes.
+   *
+   * Minted server-side as `t{n}`; the client never generates these.
+   * Undefined until the linker has run (e.g. still streaming phase-1).
+   */
+  track_id?: string;
 };
 
 export type KnownLabel = {
@@ -230,6 +240,48 @@ export function agenticCuratorConcurrency(): number {
   return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 16;
 }
 
+/**
+ * Model ID for the phase-1.5 linker (see lib/server/agentic-linker.ts).
+ * The linker is a narrow structured-output task — no reasoning, no code
+ * execution — so it benefits from a cheaper/faster tier when available.
+ * Defaults to the same model as the curator so it Just Works without
+ * extra env wiring; set AGENTIC_LINKER_MODEL=gemini-3.1-flash-lite-preview
+ * to save ~half the tokens on identity bookkeeping.
+ */
+export function agenticLinkerModelId(): string {
+  return process.env.AGENTIC_LINKER_MODEL || agenticModelId();
+}
+
+export function agenticLinkerLanguageModel() {
+  return getGoogleProvider()(agenticLinkerModelId());
+}
+
+/**
+ * Provider options tuned for the linker. Unlike the curator/navigator
+ * we deliberately drop the thinking level — identity matching across two
+ * frames is pattern-recognition, not deliberation — and drop media
+ * resolution one notch because the model mostly needs layout context,
+ * not pixel-perfect glyph reading (box texts are provided in-prompt).
+ */
+export function agenticLinkerProviderOptions() {
+  const google: GoogleGenerativeAIProviderOptions = {
+    thinkingConfig: { thinkingLevel: "low" },
+    mediaResolution: "MEDIA_RESOLUTION_MEDIUM",
+  };
+  return { google } as const;
+}
+
+/**
+ * How many adjacent-frame linker calls run in parallel. Each call is
+ * ordering-dependent on the previous call's track-id output, so the
+ * linker is driven as a *serial chain* today. Kept for future use if we
+ * switch to a windowed approach.
+ */
+export function agenticLinkerConcurrency(): number {
+  const raw = Number(process.env.AGENTIC_LINKER_CONCURRENCY || "1");
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 1;
+}
+
 export function agenticNavigatorMaxSteps(): number {
   const raw = Number(process.env.AGENTIC_NAVIGATOR_MAX_STEPS || "250");
   return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 250;
@@ -258,9 +310,10 @@ export function agenticCascadeConcurrency(): number {
 
 /**
  * Max cascade chain length in a single direction from a seed anchor. A
- * chain stops when the agent reports `still_visible=false`, runs into a
- * frame already claimed by another chain in the same direction, reaches
- * end of range, OR this depth ceiling is hit.
+ * chain stops when the agent reports `still_visible=false`, trips the
+ * quiet-streak guard, runs into a frame already claimed by another chain
+ * in the same direction, reaches end of range, OR this depth ceiling is
+ * hit.
  */
 export function agenticCascadeMaxDepth(): number {
   const raw = Number(process.env.AGENTIC_CASCADE_MAX_DEPTH || "20");
@@ -268,14 +321,37 @@ export function agenticCascadeMaxDepth(): number {
 }
 
 /**
+ * Quiet-streak stop: when N consecutive agents in a chain each report
+ * `still_visible=true` AND make zero modifications (no added / removed
+ * boxes), we conclude the chain is stuck in "verify stable content" mode
+ * and terminate. Transient-partial chains get reset on any modification,
+ * so the guard doesn't interfere with the legit cascade use case.
+ *
+ * Default 2: aggressive but hugely effective on stable-content videos.
+ * Bump to 3+ if you want the chain more patient before giving up.
+ */
+export function agenticCascadeQuietCap(): number {
+  const raw = Number(process.env.AGENTIC_CASCADE_QUIET_CAP || "2");
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 2;
+}
+
+/**
  * Total safety ceiling on how many focused agents a single navigate run
  * can spawn across all chain seeds combined. Guards against runaway
  * fan-out on pathological inputs. Bidirectional chains roughly double
  * the seed count vs. forward-only, so this is set generously.
+ *
+ * Raised from 120 → 300 now that ``findChainSeeds`` no longer dedups
+ * transitions globally by ``(text, direction)``. The old dedup silently
+ * swallowed legitimate re-investigations (e.g. same text hidden by a
+ * popup later in the same video), so we let every transition seed its
+ * own chain and rely on the per-direction ``frame_already_claimed``
+ * stop to keep real-agent-count close to the number of distinct
+ * transition frames. Accuracy > cost.
  */
 export function agenticCascadeMaxAgents(): number {
-  const raw = Number(process.env.AGENTIC_CASCADE_MAX_AGENTS || "120");
-  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 120;
+  const raw = Number(process.env.AGENTIC_CASCADE_MAX_AGENTS || "300");
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 300;
 }
 
 /** Per-focused-agent step ceiling (single focused agent is narrow, so this

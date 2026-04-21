@@ -22,12 +22,14 @@
 // structured-output task and the extra tool turns would just add latency.
 // Cascade + navigator get code execution for per-box investigation.
 
-import { generateObject } from "ai";
+import { generateObject, type LanguageModelUsage } from "ai";
 import { z } from "zod";
 import { aerr, alog } from "./agentic-log";
+import { geminiCost } from "./cost";
 import {
   BOX_FORMAT_NOTE,
   agenticLanguageModel,
+  agenticModelId,
   agenticModelSlug,
   agenticProviderOptions,
   agenticThinkingLevel,
@@ -35,6 +37,7 @@ import {
   pixelBoxToNormalizedBbox,
   type ServerBox,
 } from "./openrouter";
+import { compact, type RunLog } from "./run-log";
 
 // 4-integer bbox expressed as a fixed-length homogeneous array. This shape
 // passes Gemini's response_json_schema validation cleanly (tuple /
@@ -75,6 +78,8 @@ export type CuratorResult = {
   added: ServerBox[];
   dropped: number[];
   raw: unknown;
+  /** AI SDK token usage for the single Gemini call. Fed into cost.ts. */
+  usage: LanguageModelUsage | null;
 };
 
 function system(): string {
@@ -87,6 +92,13 @@ function system(): string {
     '- Concrete example: if the query is "test word" and the frame shows "test wor", "tes", "t word", "TEST WORD", or "testw0rd", ALL of those must be covered.',
     "- Partial reveals across adjacent frames let a viewer reassemble the full sensitive text. A box labeled with a partial string is NOT a reason to drop it — it is the exact reason to keep it.",
     "- When in doubt, KEEP. Over-redaction is safe; under-redaction is a leak. Never drop a box just because what it covers is 'incomplete'.",
+    "",
+    "OCCLUSION SLIVERS (popups, modals, dropdowns, tooltips, menus):",
+    "- A popup/modal/dropdown/tooltip that opens OVER a cell of sensitive text can leave a thin sliver of that text visible at the right, left, top, or bottom EDGE of the popup. Even 1 or 2 characters of the query text remaining visible is a LEAK — a viewer can sometimes reassemble the full string from such slivers across frames.",
+    "- Signals that a popup is present on this frame: many short text labels clustered together (font names, menu items, filter options), a rectangular band of text inserted mid-frame that isn't in the surrounding spreadsheet/document content.",
+    "- When you notice a popup signature, LOOK CAREFULLY in the raw-OCR dump for SHORT blocks (1-3 characters) whose text is any substring of the query and whose y-coordinate roughly matches where sensitive text normally sits in the layout. Those are almost certainly the uncovered edge of the query text peeking past the popup. ADD a redaction box for EACH such sliver using the raw-OCR block's exact bbox.",
+    '- Concrete example: if the query is "test word" and a dropdown covers most of a "test wor" cell, OCR might report just the word "or" (2 chars) with a tiny bbox at the right edge of the popup region. That "or" block IS the sliver — add a redaction for it.',
+    "- A 2-character raw-OCR block that is a query substring is a HIGH-PRIORITY addition target, NOT a noise block to ignore — especially when neighboring frames (without the popup) have a larger OCR candidate at the same y-coordinate.",
     "",
     "DECISIONS (strict definitions):",
     "- keep=true → the OCR rectangle covers visible pixels that are the query OR any substring / prefix / suffix / case-variant / OCR-garbled / fuzzy version of it. These pixels must be redacted.",
@@ -260,6 +272,8 @@ export async function curateFrame(opts: {
    * and copy those coords into `additions` instead of guessing.
    */
   ocrRaw?: unknown;
+  /** Optional per-run JSONL log. Curator writes one entry per call. */
+  runLog?: RunLog | null;
 }): Promise<CuratorResult> {
   const {
     jpeg,
@@ -269,6 +283,7 @@ export async function curateFrame(opts: {
     frameHeight,
     ocrBoxes,
     ocrRaw,
+    runLog,
   } = opts;
   const model = agenticLanguageModel();
 
@@ -326,6 +341,7 @@ export async function curateFrame(opts: {
     '  additions: zero or more {"bbox", "text", "reason"} for missed instances. Bbox is [y_min, x_min, y_max, x_max] in 0..1000 (Gemini\'s native box_2d format). In `reason`, note which raw OCR block (WORD[i]/LINE[i]) you copied coords from, or explain why you had to estimate.',
   ].join("\n");
 
+  const systemPrompt = system();
   alog(`curator frame #${frameIndex} request`, {
     model: agenticModelSlug(),
     thinking_level: agenticThinkingLevel(),
@@ -337,6 +353,22 @@ export async function curateFrame(opts: {
     raw_ocr_context: contextRaw.length,
     user_text: userText,
   });
+  runLog?.write({
+    kind: "curator_request",
+    frame_index: frameIndex,
+    model: agenticModelSlug(),
+    thinking_level: agenticThinkingLevel(),
+    query,
+    frame_width: frameWidth,
+    frame_height: frameHeight,
+    jpeg_bytes: jpeg.byteLength,
+    ocr_candidates: ocrBoxes.length,
+    raw_ocr_total: rawItems.length,
+    raw_ocr_relevant: relevantRaw.length,
+    raw_ocr_context: contextRaw.length,
+    system_prompt: systemPrompt,
+    user_text: userText,
+  });
 
   const t0 = Date.now();
   let result;
@@ -344,7 +376,7 @@ export async function curateFrame(opts: {
     result = await generateObject({
       model,
       schema: CuratorOutputSchema,
-      system: system(),
+      system: systemPrompt,
       providerOptions: agenticProviderOptions(),
       messages: [
         {
@@ -358,6 +390,11 @@ export async function curateFrame(opts: {
     });
   } catch (e) {
     aerr(`curator frame #${frameIndex} generateObject failed`, e);
+    runLog?.write({
+      kind: "curator_error",
+      frame_index: frameIndex,
+      error: e instanceof Error ? e.message : String(e),
+    });
     throw e;
   }
   const elapsed = Date.now() - t0;
@@ -368,6 +405,26 @@ export async function curateFrame(opts: {
     finishReason: result.finishReason,
     warnings: result.warnings,
     object: parsed,
+  });
+
+  const callCost = geminiCost(agenticModelId(), {
+    inputTokens: result.usage?.inputTokens ?? 0,
+    outputTokens: result.usage?.outputTokens ?? 0,
+    reasoningTokens: result.usage?.outputTokenDetails?.reasoningTokens ?? 0,
+    cachedInputTokens: result.usage?.inputTokenDetails?.cacheReadTokens ?? 0,
+    callCount: 1,
+  });
+  runLog?.write({
+    kind: "curator_response",
+    frame_index: frameIndex,
+    elapsed_ms: elapsed,
+    finish_reason: result.finishReason,
+    warnings: result.warnings,
+    object: compact(parsed),
+    usage: result.usage,
+    cost_usd: callCost.totalUSD,
+    input_usd: callCost.inputUSD,
+    output_usd: callCost.outputUSD,
   });
 
   const keepByIndex = new Map<number, CuratorDecision>();
@@ -419,7 +476,9 @@ export async function curateFrame(opts: {
     dropped_indices: dropped,
     kept_texts: kept.map((b) => b.text),
     added_texts: added.map((b) => b.text),
+    input_tokens: result.usage?.inputTokens ?? null,
+    output_tokens: result.usage?.outputTokens ?? null,
   });
 
-  return { kept, added, dropped, raw: parsed };
+  return { kept, added, dropped, raw: parsed, usage: result.usage ?? null };
 }
