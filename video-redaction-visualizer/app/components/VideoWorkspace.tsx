@@ -1104,6 +1104,7 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
       const blob = await exportRedactedVideo(file, {
         fps: framesResult.fps,
         dedupThreshold: framesResult.dedup_threshold,
+        maxGap: framesResult.max_gap,
         frameWidth: refWidth,
         frameHeight: refHeight,
         boxesByFrame,

@@ -33,7 +33,7 @@ export async function runPassRoute(
       headers: { "Content-Type": "application/json" },
     });
   }
-  const { file, query, fps, dedupThreshold } = parsed;
+  const { file, query, fps, dedupThreshold, maxGap } = parsed;
   let { frameFrom, frameTo } = parsed;
   const qNorm = normalizeQuery(query);
 
@@ -43,6 +43,7 @@ export async function runPassRoute(
       file,
       fps: fps ?? undefined,
       dedupThreshold,
+      maxGap,
     });
   } catch (e) {
     return new Response(
@@ -96,6 +97,7 @@ export async function runPassRoute(
       queryNorm: qNorm,
       fps: fps ?? null,
       dedupThreshold,
+      maxGap,
       frameFrom: lo,
       frameTo: hi,
     });
@@ -107,6 +109,7 @@ export async function runPassRoute(
           qNorm,
           fps: fps ?? null,
           dedupThreshold,
+          maxGap,
           lo,
           hi,
         });
@@ -183,6 +186,7 @@ async function populatePhase1(opts: {
   qNorm: string;
   fps: number | null;
   dedupThreshold: number;
+  maxGap: number;
   lo: number;
   hi: number;
 }): Promise<CacheEntry> {
@@ -192,6 +196,7 @@ async function populatePhase1(opts: {
     queryNorm: opts.qNorm,
     fps: opts.fps,
     dedupThreshold: opts.dedupThreshold,
+    maxGap: opts.maxGap,
     frameFrom: opts.lo,
     frameTo: opts.hi,
   });

@@ -17,8 +17,30 @@ export type DeduplicatedFramesResponse = {
   video_hash?: string;
   fps: number | null;
   dedup_threshold: number;
+  /**
+   * Upper bound on the run of consecutive raw frames skipped between
+   * kept frames. Set to 1 by default so the tween between adjacent kept
+   * frames never spans more than ~2 raw-frame steps. Part of the cache
+   * key for both Python and TS caches — callers forward it verbatim
+   * from here to detect / export / backtrack routes.
+   */
+  max_gap?: number;
+  /**
+   * Effective frame rate at which ffmpeg emitted the raw sequence. Used
+   * by the gap-filler and exporter to resolve `kept_source_indices`
+   * back to timestamps in the source video. `null` when the source fps
+   * couldn't be probed and no explicit `fps` was passed.
+   */
+  source_fps?: number | null;
   raw_frame_count: number;
   deduplicated_count: number;
+  /**
+   * 0-based index into the original ffmpeg-emitted sequence for each
+   * kept frame. Parallel to `frames` (index `k` of `kept_source_indices`
+   * describes `frames[k]`). The gap-filler bisects these values to
+   * request specific raw frames via /api/frames/by_source_index.
+   */
+  kept_source_indices?: number[];
   // Reference pixel dimensions shared by every kept frame. Detection
   // boxes live in this space; the exporter uses it to scale boxes up to
   // the source video's native resolution.
@@ -173,10 +195,50 @@ export type DetectLinkEvent = {
   }>;
 };
 
+/**
+ * Post-linker gap-filler insertion. Emitted after the normal
+ * curator/linker stream has landed but before ``cost_final``/``done``,
+ * one event per frame that the gap-filler recursively added between
+ * two adjacent kept frames. The frame sits at source index ``source_index``
+ * (between the two kept frames' source indices) and carries its own
+ * boxes + track_ids, already linked into the outer track graph — no
+ * separate ``frame`` / ``link`` events follow.
+ *
+ * Indices are minted as fresh integers past the original kept count
+ * (``kept_count + 1``, ``+2``, …). Clients should splice the new
+ * frame into their kept-frame array using the ``between`` pair, not
+ * the raw ``virtual_index`` ordering; two inserts may share the same
+ * ``between`` pair at different recursion depths.
+ */
+export type DetectInsertedFrameEvent = {
+  type: "inserted_frame";
+  /** The two kept-frame indices this insert sits between, in the
+   *  original dedup sequence. */
+  between: [number, number];
+  /** Recursion depth (0 at the first bisection of an original gap). */
+  depth: number;
+  /** Human-readable trigger that caused the bisection; useful for
+   *  post-hoc threshold analysis. */
+  trigger_reason: string;
+  /** 0-based index into the original ffmpeg-emitted sequence. */
+  source_index: number;
+  frame: {
+    width: number;
+    height: number;
+    /** Base64-encoded JPEG of the inserted frame. Decode client-side
+     *  and render into the same frame list as the original kept
+     *  frames, positioned by ``between`` + ``source_index``. */
+    jpeg_base64: string;
+    boxes: DetectionBox[];
+    track_ids: string[];
+  };
+};
+
 export type DetectEvent =
   | DetectStartEvent
   | DetectFrameEvent
   | DetectLinkEvent
+  | DetectInsertedFrameEvent
   | DetectDoneEvent
   | DetectErrorEvent
   | CostUpdateEvent
@@ -187,6 +249,13 @@ export type StreamDetectOptions = {
   frameTo?: number;
   fps?: number;
   dedupThreshold?: number;
+  /**
+   * Upper bound on consecutive raw frames skipped between kept frames.
+   * Plumbed to the Python backend so the kept-frame sequence (and
+   * therefore all dedup-keyed caches) match the value used at extract
+   * time. Defaults to 1 on the backend.
+   */
+  maxGap?: number;
   // "ocr"     → Python backend /api/ocr/*      (default)
   // "gemini"  → Next.js route   /api/gemini/*   (same-origin, Vercel AI SDK)
   // "teamwork"→ Next.js route   /api/teamwork/* (OCR + Gemini cooperation)
@@ -354,6 +423,9 @@ function buildDetectForm(
   if (opts.fps != null) form.append("fps", String(opts.fps));
   if (opts.dedupThreshold != null) {
     form.append("dedup_threshold", String(opts.dedupThreshold));
+  }
+  if (opts.maxGap != null) {
+    form.append("max_gap", String(opts.maxGap));
   }
   return form;
 }
@@ -571,6 +643,13 @@ export type ExportStyle = {
 export type ExportRedactedVideoOptions = {
   fps?: number | null;
   dedupThreshold?: number;
+  /**
+   * Max-gap used at detect time. Part of the backend frame-cache key;
+   * must match the value from `framesResult.max_gap` or the server will
+   * re-extract with a different kept-frame set and box coordinates
+   * won't line up with the kept-frame sequence the client painted on.
+   */
+  maxGap?: number;
   frameWidth: number;
   frameHeight: number;
   boxesByFrame: Record<number, ExportBoxRect[]>;
@@ -590,6 +669,8 @@ export async function exportRedactedVideo(
     // value from `framesResult.dedup_threshold`, but we keep a sane
     // fallback so the cache key still hits the server default.
     dedup_threshold: opts.dedupThreshold ?? 2,
+    // Keep in sync with `_DEFAULT_MAX_GAP` in backend/app/frame_service.py.
+    max_gap: opts.maxGap ?? 1,
     frame_width: opts.frameWidth,
     frame_height: opts.frameHeight,
     style: {

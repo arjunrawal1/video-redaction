@@ -33,7 +33,12 @@ class FrameSet:
     source_fps: float | None
 
 
-_CacheKey = tuple[str, float | None, int, int]
+# (video_hash, fps, dedup_threshold, max_gap, max_width). ``max_gap`` is
+# part of the key because it changes which frames survive dedup — two
+# runs with different ``max_gap`` values produce different kept
+# sequences, different box labels, and different exported timings, so we
+# must not alias them.
+_CacheKey = tuple[str, float | None, int, int, int]
 _cache: "OrderedDict[_CacheKey, FrameSet]" = OrderedDict()
 _lock = threading.Lock()
 
@@ -46,9 +51,10 @@ def _make_key(
     video_hash: str,
     fps: float | None,
     dedup_threshold: int,
+    max_gap: int,
     max_width: int,
 ) -> _CacheKey:
-    return (video_hash, fps, dedup_threshold, max_width)
+    return (video_hash, fps, dedup_threshold, max_gap, max_width)
 
 
 def get_or_extract(
@@ -57,6 +63,7 @@ def get_or_extract(
     suffix: str,
     fps: float | None,
     dedup_threshold: int,
+    max_gap: int,
     max_width: int = 1600,
 ) -> tuple[FrameSet, str]:
     """Return cached frames for this video+params or extract and cache them.
@@ -65,7 +72,7 @@ def get_or_extract(
     for their own derived caches (e.g. OCR results).
     """
     video_hash = _hash_video(body)
-    key = _make_key(video_hash, fps, dedup_threshold, max_width)
+    key = _make_key(video_hash, fps, dedup_threshold, max_gap, max_width)
 
     with _lock:
         hit = _cache.get(key)
@@ -84,6 +91,7 @@ def get_or_extract(
         suffix=suffix,
         fps=fps,
         dedup_threshold=dedup_threshold,
+        max_gap=max_gap,
         max_width=max_width,
     )
     frame_set = FrameSet(

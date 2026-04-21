@@ -21,6 +21,7 @@ function buildForm(
     frameTo?: number;
     fps?: number | null;
     dedupThreshold?: number;
+    maxGap?: number;
   },
 ): FormData {
   const form = new FormData();
@@ -33,6 +34,9 @@ function buildForm(
   }
   if (opts.dedupThreshold != null) {
     form.append("dedup_threshold", String(opts.dedupThreshold));
+  }
+  if (opts.maxGap != null) {
+    form.append("max_gap", String(opts.maxGap));
   }
   return form;
 }
@@ -52,6 +56,7 @@ export async function fetchOcrDetect(
     frameTo?: number;
     fps?: number | null;
     dedupThreshold?: number;
+    maxGap?: number;
   },
 ): Promise<{ videoHash: string; frames: OcrFrameResult[] }> {
   const base = pythonApiBaseUrl();
@@ -136,4 +141,71 @@ export async function fetchOcrDetect(
 
   frames.sort((a, b) => a.index - b.index);
   return { videoHash, frames };
+}
+
+/**
+ * Run Textract on a single JPEG blob and return the matching boxes plus
+ * the raw response. Used by the post-detection gap-filler: inserted
+ * frames aren't part of any kept-frame sequence, so they can't go
+ * through the range-based /api/ocr/detect/stream endpoint — this
+ * per-frame call is the escape hatch.
+ *
+ * The caller supplies the raw JPEG bytes (not the full video) and the
+ * same ``query`` that the rest of the pipeline is using. Output shape
+ * matches a single entry of ``fetchOcrDetect.frames``, but without an
+ * ``index`` (gap-filler assigns its own).
+ */
+export async function fetchOcrDetectSingle(
+  jpeg: Uint8Array,
+  query: string,
+): Promise<{
+  width: number;
+  height: number;
+  boxes: ServerBox[];
+  raw: unknown;
+}> {
+  const base = pythonApiBaseUrl();
+  const form = new FormData();
+  // Include a filename so multer/FastAPI classify the upload as a file
+  // rather than a form field. JPEG MIME chosen to match our extraction
+  // pipeline; Textract accepts JPEG/PNG interchangeably either way.
+  const blob = new Blob([jpeg as Uint8Array<ArrayBuffer>], {
+    type: "image/jpeg",
+  });
+  form.append("file", blob, "frame.jpg");
+  form.append("query", query);
+
+  const res = await fetch(`${base}/api/ocr/detect/single`, {
+    method: "POST",
+    body: form,
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(
+      `Python OCR single-frame detect failed: ${res.status}${text ? ` ${text}` : ""}`,
+    );
+  }
+  const body = (await res.json()) as {
+    width: number;
+    height: number;
+    boxes: Array<Record<string, number | string>>;
+    raw: unknown;
+  };
+  const boxes: ServerBox[] = (body.boxes ?? []).map(
+    (b) =>
+      ({
+        x: Number(b.x),
+        y: Number(b.y),
+        w: Number(b.w),
+        h: Number(b.h),
+        text: String(b.text ?? ""),
+        score: Number(b.score ?? 1),
+      }) as ServerBox,
+  );
+  return {
+    width: Number(body.width ?? 0),
+    height: Number(body.height ?? 0),
+    boxes,
+    raw: body.raw ?? null,
+  };
 }

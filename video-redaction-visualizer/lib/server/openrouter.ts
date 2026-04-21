@@ -272,14 +272,24 @@ export function agenticLinkerProviderOptions() {
 }
 
 /**
- * How many adjacent-frame linker calls run in parallel. Each call is
- * ordering-dependent on the previous call's track-id output, so the
- * linker is driven as a *serial chain* today. Kept for future use if we
- * switch to a windowed approach.
+ * How many phase-1.5 linker Gemini calls run in parallel.
+ *
+ * Contrary to naïve intuition, linker model calls are completely
+ * data-independent: each pair call only receives boxesA/boxesB and the
+ * two frame JPEGs — it has no knowledge of track ids. Track ids are
+ * minted serially AFTER all calls return, by walking the returned
+ * index→index mappings in frame order ("stitch" step). So the model
+ * calls can safely fan out; the only per-pair ordering requirement is
+ * that the stitch phase sees every pair's decisions before threading
+ * the chain, which `Promise.all` guarantees.
+ *
+ * Default 16 mirrors the curator's observed Gemini concurrency
+ * ceiling. Bump if your provider rate limit allows more; set to 1 to
+ * force fully-serial behavior for debugging or A/B comparisons.
  */
 export function agenticLinkerConcurrency(): number {
-  const raw = Number(process.env.AGENTIC_LINKER_CONCURRENCY || "1");
-  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 1;
+  const raw = Number(process.env.AGENTIC_LINKER_CONCURRENCY || "16");
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 16;
 }
 
 export function agenticNavigatorMaxSteps(): number {
@@ -359,6 +369,25 @@ export function agenticCascadeMaxAgents(): number {
 export function agenticFocusedMaxSteps(): number {
   const raw = Number(process.env.AGENTIC_FOCUSED_MAX_STEPS || "20");
   return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 20;
+}
+
+/**
+ * Speculative cascade lookahead. Each chain runs up to this many
+ * focused agents in parallel — the head of the chain plus N-1 speculated
+ * descendants. When an agent returns `still_visible=false` or trips the
+ * quiet-streak guard, every speculated agent past it is aborted and its
+ * mutations are rolled back, so chain behavior is identical to the
+ * sequential baseline — just faster when chains are long. Cost scales
+ * linearly; set to 1 to disable speculation entirely.
+ *
+ * Default 4 is a safe sweet spot: long backward/forward chains (depth
+ * ≥ 8 is common on scrolling content) get a ~4x wall-time reduction on
+ * the critical path, while wasted work is capped because chains that
+ * genuinely stop near their anchor only speculate a few frames ahead.
+ */
+export function agenticCascadeSpeculationDepth(): number {
+  const raw = Number(process.env.AGENTIC_CASCADE_SPECULATION_DEPTH || "4");
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 4;
 }
 
 // -- Bbox conversion ------------------------------------------------------

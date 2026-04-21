@@ -36,13 +36,19 @@ class OcrEntry:
     query_norm: str
     fps: float | None
     dedup_threshold: int
+    # ``max_gap`` is part of the cache identity because it changes which
+    # raw frames survive dedup, which in turn changes the 1-indexed
+    # frame numbering the per-frame OCR results live under. Caching
+    # across different ``max_gap`` values would silently alias unrelated
+    # frame sets.
+    max_gap: int
     frame_from: int
     frame_to: int
     # 1-indexed frame number -> phase-1 state.
     per_frame: dict[int, FramePhase1] = field(default_factory=dict)
 
 
-_CacheKey = tuple[str, str, float | None, int, int, int]
+_CacheKey = tuple[str, str, float | None, int, int, int, int]
 _cache: "OrderedDict[_CacheKey, OcrEntry]" = OrderedDict()
 _lock = threading.Lock()
 
@@ -52,10 +58,19 @@ def _make_key(
     query_norm: str,
     fps: float | None,
     dedup_threshold: int,
+    max_gap: int,
     frame_from: int,
     frame_to: int,
 ) -> _CacheKey:
-    return (video_hash, query_norm, fps, dedup_threshold, frame_from, frame_to)
+    return (
+        video_hash,
+        query_norm,
+        fps,
+        dedup_threshold,
+        max_gap,
+        frame_from,
+        frame_to,
+    )
 
 
 def create_entry(
@@ -64,6 +79,7 @@ def create_entry(
     query_norm: str,
     fps: float | None,
     dedup_threshold: int,
+    max_gap: int,
     frame_from: int,
     frame_to: int,
 ) -> OcrEntry:
@@ -78,10 +94,13 @@ def create_entry(
         query_norm=query_norm,
         fps=fps,
         dedup_threshold=dedup_threshold,
+        max_gap=max_gap,
         frame_from=frame_from,
         frame_to=frame_to,
     )
-    key = _make_key(video_hash, query_norm, fps, dedup_threshold, frame_from, frame_to)
+    key = _make_key(
+        video_hash, query_norm, fps, dedup_threshold, max_gap, frame_from, frame_to,
+    )
     with _lock:
         _cache[key] = entry
         _cache.move_to_end(key)
@@ -96,11 +115,14 @@ def get_entry(
     query_norm: str,
     fps: float | None,
     dedup_threshold: int,
+    max_gap: int,
     frame_from: int,
     frame_to: int,
 ) -> OcrEntry | None:
     """Return the cached entry for this key, or None. Touches LRU order."""
-    key = _make_key(video_hash, query_norm, fps, dedup_threshold, frame_from, frame_to)
+    key = _make_key(
+        video_hash, query_norm, fps, dedup_threshold, max_gap, frame_from, frame_to,
+    )
     with _lock:
         hit = _cache.get(key)
         if hit is not None:

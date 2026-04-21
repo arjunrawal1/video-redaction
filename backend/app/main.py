@@ -18,7 +18,7 @@ from PIL import Image
 from starlette.background import BackgroundTask
 
 from app.frame_cache import get_or_extract
-from app.frame_service import FrameExtractionError
+from app.frame_service import FrameExtractionError, extract_frames_by_source_index
 from app.logging_config import configure as configure_logging
 from app import ocr_backtrack, ocr_cache, video_export
 from app.ocr_service import (
@@ -113,6 +113,20 @@ async def deduplicated_frames(
             "hash distance exceeds the threshold)."
         ),
     ),
+    max_gap: int = Query(
+        1,
+        ge=0,
+        le=240,
+        description=(
+            "Upper bound on consecutive raw frames skipped between kept "
+            "frames. Forces a keep once the run of skipped frames "
+            "exceeds this value, even when both hashes stay under "
+            "dedup_threshold. Default 1 (kept frames at most ~2 raw-"
+            "frame steps apart, i.e. ~66 ms at 30 fps) to bound the "
+            "motion/resize a tween has to cover between kept frames. "
+            "Use 0 to keep every decoded frame."
+        ),
+    ),
 ) -> dict:
     """
     Accept a video file, extract frames (every decoded frame by default, or at
@@ -133,6 +147,7 @@ async def deduplicated_frames(
             suffix=suffix,
             fps=fps,
             dedup_threshold=dedup_threshold,
+            max_gap=max_gap,
         )
     except FrameExtractionError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
@@ -163,8 +178,129 @@ async def deduplicated_frames(
         "video_hash": video_hash,
         "fps": fps,
         "dedup_threshold": dedup_threshold,
+        "max_gap": max_gap,
+        "source_fps": frame_set.source_fps,
         "raw_frame_count": frame_set.raw_count,
         "deduplicated_count": frame_set.kept_count,
+        # 0-based index into the original ffmpeg-emitted sequence for
+        # each kept frame. The Next.js gap-filler uses this to bisect
+        # kept pairs in source-index space and request specific raw
+        # frames from /api/frames/by_source_index.
+        "kept_source_indices": list(frame_set.kept_source_indices),
+        "frame_width": frame_width,
+        "frame_height": frame_height,
+        "frames": frames_out,
+    }
+
+
+@app.post("/api/frames/by_source_index")
+async def frames_by_source_index(
+    file: UploadFile = File(...),
+    source_indices: str = Form(
+        ...,
+        description=(
+            "JSON array of 0-based indices into the original ffmpeg-"
+            "emitted sequence, e.g. `[12, 47, 133]`. These are the same "
+            "values that appear in `kept_source_indices` from the "
+            "/api/frames/deduplicated response — the gap-filler uses "
+            "them to request raw frames that initial dedup discarded."
+        ),
+    ),
+    fps: float | None = Form(
+        None,
+        description=(
+            "Must match the `fps` used when the caller originally "
+            "fetched /api/frames/deduplicated. The indices are "
+            "interpreted against ffmpeg's decoded-frame stream after "
+            "applying the same `fps` filter, so a mismatch would "
+            "resolve to different source frames."
+        ),
+    ),
+) -> dict:
+    """Return JPEG bytes for specific raw source frames.
+
+    Used by the Next.js gap-filler (``lib/server/gap-filler.ts``) when
+    motion or resize between two adjacent kept frames exceeds the
+    smoothness-invariant thresholds. The filler wants to insert
+    detection results on a frame that dedup dropped; we re-run ffmpeg
+    with a ``select=eq(n,i)+…`` filter to pull those exact frames
+    without reprocessing the whole video.
+
+    This endpoint does NOT touch the frame cache — it is a per-call
+    re-extraction keyed by request. Results are small (a handful of
+    frames per call) and the caller is responsible for deduping repeat
+    requests.
+    """
+    _validate_video(file)
+    body = await file.read()
+    if not body:
+        raise HTTPException(status_code=400, detail="Empty file.")
+    if len(body) > _MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="File too large.")
+
+    try:
+        indices_raw = json.loads(source_indices)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"source_indices must be a JSON array: {e}",
+        ) from e
+    if not isinstance(indices_raw, list):
+        raise HTTPException(
+            status_code=400, detail="source_indices must be a JSON array.",
+        )
+    try:
+        indices: list[int] = [int(i) for i in indices_raw]
+    except (TypeError, ValueError) as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"source_indices must be integers: {e}",
+        ) from e
+    # Cap request size so a misbehaving caller can't ask for half the
+    # video one frame at a time. At the default `max_gap=1` + bisection
+    # depth 5, the worst-case ask is ~31 frames per original gap across
+    # hundreds of gaps, which still fits under this cap per request.
+    if len(indices) > 2048:
+        raise HTTPException(
+            status_code=400, detail="Too many source_indices (max 2048).",
+        )
+
+    if fps is not None and fps <= 0:
+        fps = None
+
+    suffix = _guess_suffix(file.filename)
+    try:
+        results = extract_frames_by_source_index(
+            body,
+            suffix=suffix,
+            source_indices=indices,
+            fps=fps,
+        )
+    except FrameExtractionError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+
+    mime = "image/jpeg"
+    frames_out = []
+    dims_cache: tuple[int, int] | None = None
+    for src_index, b in results:
+        if dims_cache is None:
+            try:
+                with Image.open(io.BytesIO(b)) as im:
+                    dims_cache = im.size
+            except Exception:  # pragma: no cover
+                dims_cache = (0, 0)
+        frames_out.append(
+            {
+                "source_index": src_index,
+                "mime": mime,
+                "data_base64": base64.b64encode(b).decode("ascii"),
+            }
+        )
+    frame_width, frame_height = dims_cache or (0, 0)
+
+    return {
+        "filename": file.filename,
+        "fps": fps,
         "frame_width": frame_width,
         "frame_height": frame_height,
         "frames": frames_out,
@@ -185,6 +321,7 @@ async def detect_stream(
     frame_to: int | None = Form(None),
     fps: float | None = Form(None),
     dedup_threshold: int = Form(2),
+    max_gap: int = Form(1, ge=0, le=240),
 ) -> StreamingResponse:
     """Stream OCR detections across a frame range as NDJSON.
 
@@ -207,7 +344,7 @@ async def detect_stream(
 
     log.info(
         "stream detect: recv file=%r bytes=%d query=%r range=%s..%s "
-        "fps=%s dedup_threshold=%d",
+        "fps=%s dedup_threshold=%d max_gap=%d",
         file.filename,
         len(body),
         query,
@@ -215,6 +352,7 @@ async def detect_stream(
         frame_to,
         fps,
         dedup_threshold,
+        max_gap,
     )
 
     suffix = _guess_suffix(file.filename)
@@ -225,6 +363,7 @@ async def detect_stream(
             suffix=suffix,
             fps=fps,
             dedup_threshold=dedup_threshold,
+            max_gap=max_gap,
         )
     except FrameExtractionError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
@@ -305,6 +444,7 @@ async def detect_stream(
             query_norm=q_norm,
             fps=fps,
             dedup_threshold=dedup_threshold,
+            max_gap=max_gap,
             frame_from=lo_1,
             frame_to=hi_1,
         )
@@ -439,14 +579,15 @@ async def _populate_phase1_for_backtrack(
     q_norm: str,
     fps: float | None,
     dedup_threshold: int,
+    max_gap: int,
     lo_1: int,
     hi_1: int,
 ) -> ocr_cache.OcrEntry:
     """Run phase-1 detection over the selected frames into the OCR cache.
 
     Used by /api/ocr/backtrack when no cached entry exists for the given
-    (video_hash, query_norm, fps, dedup_threshold, range). Same fan-out
-    strategy as detect_stream, just no NDJSON emission.
+    (video_hash, query_norm, fps, dedup_threshold, max_gap, range). Same
+    fan-out strategy as detect_stream, just no NDJSON emission.
     """
     await asyncio.to_thread(ensure_reader_loaded)
     entry = ocr_cache.create_entry(
@@ -454,6 +595,7 @@ async def _populate_phase1_for_backtrack(
         query_norm=q_norm,
         fps=fps,
         dedup_threshold=dedup_threshold,
+        max_gap=max_gap,
         frame_from=lo_1,
         frame_to=hi_1,
     )
@@ -493,6 +635,7 @@ async def _run_pass_stream(
     frame_to: int | None,
     fps: float | None,
     dedup_threshold: int,
+    max_gap: int,
     pass_name: str,
     origin: str,
     driver,
@@ -517,7 +660,7 @@ async def _run_pass_stream(
 
     log.info(
         "%s: recv file=%r bytes=%d query=%r range=%s..%s "
-        "fps=%s dedup_threshold=%d",
+        "fps=%s dedup_threshold=%d max_gap=%d",
         pass_name,
         file.filename,
         len(body),
@@ -526,6 +669,7 @@ async def _run_pass_stream(
         frame_to,
         fps,
         dedup_threshold,
+        max_gap,
     )
 
     suffix = _guess_suffix(file.filename)
@@ -535,6 +679,7 @@ async def _run_pass_stream(
             suffix=suffix,
             fps=fps,
             dedup_threshold=dedup_threshold,
+            max_gap=max_gap,
         )
     except FrameExtractionError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
@@ -577,6 +722,7 @@ async def _run_pass_stream(
             query_norm=q_norm,
             fps=fps,
             dedup_threshold=dedup_threshold,
+            max_gap=max_gap,
             frame_from=lo_1,
             frame_to=hi_1,
         )
@@ -596,6 +742,7 @@ async def _run_pass_stream(
                     q_norm=q_norm,
                     fps=fps,
                     dedup_threshold=dedup_threshold,
+                    max_gap=max_gap,
                     lo_1=lo_1,
                     hi_1=hi_1,
                 )
@@ -668,6 +815,62 @@ async def _run_pass_stream(
     )
 
 
+@app.post("/api/ocr/detect/single")
+async def detect_single_frame(
+    file: UploadFile = File(
+        ...,
+        description="A single JPEG/PNG frame to OCR.",
+    ),
+    query: str = Form(..., min_length=1, max_length=200),
+) -> dict:
+    """Run Textract on one image and return boxes + raw response.
+
+    Used by the Next.js gap-filler so inserted frames (fetched via
+    /api/frames/by_source_index) can be curated with the same OCR
+    evidence that kept frames get. Unlike the stream endpoint, this
+    takes the JPEG bytes directly rather than resolving a frame index
+    through the extraction cache, so callers can OCR ad-hoc frames that
+    aren't part of any kept sequence.
+    """
+    content_type = (file.content_type or "").lower()
+    if content_type and not (
+        content_type.startswith("image/")
+        or content_type in ("application/octet-stream", "binary/octet-stream")
+    ):
+        raise HTTPException(
+            status_code=415,
+            detail="Expected an image Content-Type (image/*) or octet-stream.",
+        )
+    body = await file.read()
+    if not body:
+        raise HTTPException(status_code=400, detail="Empty file.")
+    if len(body) > _MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="File too large.")
+
+    q_norm = normalize_query(query)
+    if not q_norm:
+        return {"width": 0, "height": 0, "boxes": [], "raw": None}
+
+    await asyncio.to_thread(ensure_reader_loaded)
+    det, raw = await asyncio.to_thread(detect_frame, body, q_norm)
+    return {
+        "width": det.width,
+        "height": det.height,
+        "boxes": [
+            {
+                "x": b.x,
+                "y": b.y,
+                "w": b.w,
+                "h": b.h,
+                "text": b.text,
+                "score": round(b.score, 3),
+            }
+            for b in det.boxes
+        ],
+        "raw": raw,
+    }
+
+
 @app.post("/api/ocr/backtrack")
 async def backtrack_stream(
     file: UploadFile = File(...),
@@ -676,6 +879,7 @@ async def backtrack_stream(
     frame_to: int | None = Form(None),
     fps: float | None = Form(None),
     dedup_threshold: int = Form(2),
+    max_gap: int = Form(1, ge=0, le=240),
 ) -> StreamingResponse:
     """Stream backward-pass hits as NDJSON.
 
@@ -690,6 +894,7 @@ async def backtrack_stream(
         frame_to=frame_to,
         fps=fps,
         dedup_threshold=dedup_threshold,
+        max_gap=max_gap,
         pass_name="backtrack",
         origin="backtrack",
         driver=ocr_backtrack.run_backtrack,
@@ -704,6 +909,7 @@ async def forward_stream(
     frame_to: int | None = Form(None),
     fps: float | None = Form(None),
     dedup_threshold: int = Form(2),
+    max_gap: int = Form(1, ge=0, le=240),
 ) -> StreamingResponse:
     """Stream forward-pass hits as NDJSON.
 
@@ -720,6 +926,7 @@ async def forward_stream(
         frame_to=frame_to,
         fps=fps,
         dedup_threshold=dedup_threshold,
+        max_gap=max_gap,
         pass_name="forward",
         origin="forward",
         driver=ocr_backtrack.run_forward,
@@ -844,6 +1051,16 @@ async def export_video(
             status_code=400, detail="Invalid dedup_threshold.",
         ) from e
 
+    max_gap_raw = parsed.get("max_gap", 1)
+    try:
+        max_gap = int(max_gap_raw)
+    except (TypeError, ValueError) as e:
+        raise HTTPException(
+            status_code=400, detail="Invalid max_gap.",
+        ) from e
+    if max_gap < 0:
+        max_gap = 0
+
     try:
         ref_width = int(parsed.get("frame_width", 0))
         ref_height = int(parsed.get("frame_height", 0))
@@ -866,7 +1083,8 @@ async def export_video(
     boxes = _parse_export_boxes(parsed.get("boxes_by_frame"))
 
     log.info(
-        "export: recv file=%r bytes=%d boxes=%d ref=%dx%d fps=%s dedup=%d",
+        "export: recv file=%r bytes=%d boxes=%d ref=%dx%d fps=%s "
+        "dedup=%d max_gap=%d",
         file.filename,
         len(body),
         len(boxes),
@@ -874,6 +1092,7 @@ async def export_video(
         ref_height,
         fps,
         dedup_threshold,
+        max_gap,
     )
 
     suffix = _guess_suffix(file.filename)
@@ -883,6 +1102,7 @@ async def export_video(
             suffix=suffix,
             fps=fps,
             dedup_threshold=dedup_threshold,
+            max_gap=max_gap,
         )
     except FrameExtractionError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e

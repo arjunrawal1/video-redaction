@@ -46,7 +46,7 @@ export async function POST(req: Request): Promise<Response> {
   const parsed = await readFormInputs(req);
   if ("error" in parsed) return json(parsed.error, 400);
 
-  const { file, query, fps, dedupThreshold } = parsed;
+  const { file, query, fps, dedupThreshold, maxGap } = parsed;
   let { frameFrom, frameTo } = parsed;
   const qNorm = normalizeQuery(query);
 
@@ -56,6 +56,7 @@ export async function POST(req: Request): Promise<Response> {
       file,
       fps: fps ?? undefined,
       dedupThreshold,
+      maxGap,
     });
   } catch (e) {
     return json(e instanceof Error ? e.message : "frame extraction failed", 502);
@@ -112,6 +113,7 @@ export async function POST(req: Request): Promise<Response> {
       queryNorm: qNorm,
       fps: fps ?? null,
       dedupThreshold,
+      maxGap,
       frameFrom: lo,
       frameTo: hi,
     });

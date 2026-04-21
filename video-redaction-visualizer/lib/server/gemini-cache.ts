@@ -36,6 +36,9 @@ export type CacheEntry = {
   queryNorm: string;
   fps: number | null;
   dedupThreshold: number;
+  // Mirrors `max_gap` in the Python frame cache / ocr cache. Part of
+  // the cache identity so runs with different gap caps don't alias.
+  maxGap: number;
   frameFrom: number;
   frameTo: number;
   // 1-indexed frame number -> state
@@ -50,6 +53,7 @@ function makeKey(p: {
   queryNorm: string;
   fps: number | null;
   dedupThreshold: number;
+  maxGap: number;
   frameFrom: number;
   frameTo: number;
 }): Key {
@@ -59,6 +63,7 @@ function makeKey(p: {
     p.queryNorm,
     p.fps ?? "null",
     p.dedupThreshold,
+    p.maxGap,
     p.frameFrom,
     p.frameTo,
   ].join("|");
@@ -73,6 +78,7 @@ export function createEntry(p: {
   queryNorm: string;
   fps: number | null;
   dedupThreshold: number;
+  maxGap: number;
   frameFrom: number;
   frameTo: number;
 }): CacheEntry {
@@ -82,6 +88,7 @@ export function createEntry(p: {
     queryNorm: p.queryNorm,
     fps: p.fps,
     dedupThreshold: p.dedupThreshold,
+    maxGap: p.maxGap,
     frameFrom: p.frameFrom,
     frameTo: p.frameTo,
     perFrame: {},
@@ -101,6 +108,7 @@ export function getEntry(p: {
   queryNorm: string;
   fps: number | null;
   dedupThreshold: number;
+  maxGap: number;
   frameFrom: number;
   frameTo: number;
 }): CacheEntry | null {

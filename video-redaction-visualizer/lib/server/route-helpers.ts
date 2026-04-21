@@ -7,6 +7,7 @@ export type FormInputs = {
   frameTo: number | null;
   fps: number | null;
   dedupThreshold: number;
+  maxGap: number;
 };
 
 export async function readFormInputs(
@@ -26,6 +27,7 @@ export async function readFormInputs(
   const frameToRaw = form.get("frame_to");
   const fpsRaw = form.get("fps");
   const dedupRaw = form.get("dedup_threshold");
+  const maxGapRaw = form.get("max_gap");
 
   const asNum = (v: FormDataEntryValue | null): number | null => {
     if (v == null) return null;
@@ -41,8 +43,21 @@ export async function readFormInputs(
   // for both the Python frame cache and the Gemini/teamwork caches, so
   // drift here would silently invalidate everything.
   const dedupThreshold = Math.floor(asNum(dedupRaw) ?? 2);
+  // Keep in sync with `_DEFAULT_MAX_GAP` in backend/app/frame_service.py.
+  // Also part of the cache key in Python frame_cache, ocr_cache, and the
+  // TS gemini-cache — the kept-frame sequence differs across values of
+  // this knob, so we must not alias runs with different max_gap.
+  const maxGap = Math.max(0, Math.floor(asNum(maxGapRaw) ?? 1));
 
-  return { file, query, frameFrom, frameTo, fps, dedupThreshold };
+  return {
+    file,
+    query,
+    frameFrom,
+    frameTo,
+    fps,
+    dedupThreshold,
+    maxGap,
+  };
 }
 
 export function normalizeQuery(q: string): string {
