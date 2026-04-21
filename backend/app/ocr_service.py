@@ -417,6 +417,18 @@ def detect_frame(blob: bytes, query_norm: str) -> tuple[FrameDetections, dict]:
     return _detect_frame(blob, query_norm)
 
 
+def detect_frame_raw(blob: bytes) -> tuple[int, int, dict]:
+    """Public: run Textract on one frame and return raw blocks only.
+
+    This is used by the prompt planner/detector path, which needs the full
+    OCR payload without query pre-filtering.
+    """
+    frame_w, frame_h = _get_image_size(blob)
+    response = _call_textract(blob)
+    raw = _jsonable(response)
+    return frame_w, frame_h, raw
+
+
 def detect_text_in_frames(
     frames: Sequence[bytes],
     query: str,

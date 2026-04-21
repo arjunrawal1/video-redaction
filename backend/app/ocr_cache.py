@@ -8,13 +8,23 @@ Textract response (needed to locate partials within a region).
 
 from __future__ import annotations
 
+import os
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass, field
 
 from app.ocr_service import Box
 
-_MAX_ENTRIES = 8
+def _parse_max_entries() -> int:
+    raw = os.getenv("OCR_CACHE_MAX_ENTRIES", "32")
+    try:
+        n = int(raw)
+    except ValueError:
+        return 32
+    return max(1, n)
+
+
+_MAX_ENTRIES = _parse_max_entries()
 
 
 @dataclass

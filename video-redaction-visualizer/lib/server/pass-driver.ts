@@ -5,7 +5,7 @@
 // The Gemini pipeline plugs in its own partial finder (compareFrames over
 // two JPEGs). This module does not import any LLM code — it's pure algo.
 
-import type { CacheEntry, FrameState } from "./gemini-cache";
+import type { FrameState, QueryCacheEntry } from "./gemini-cache";
 import type { ServerBox } from "./openrouter";
 
 const LINK_CENTER_DIST = 0.08;
@@ -123,7 +123,7 @@ export type PassDirection = "backward" | "forward";
  * event to the client immediately.
  */
 export async function runPass(
-  entry: CacheEntry,
+  entry: QueryCacheEntry,
   direction: PassDirection,
   partialFinder: PartialFinder,
   onAdded: (h: AddedHit) => void,

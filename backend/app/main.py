@@ -23,6 +23,7 @@ from app.logging_config import configure as configure_logging
 from app import ocr_backtrack, ocr_cache, video_export
 from app.ocr_service import (
     detect_frame,
+    detect_frame_raw,
     ensure_reader_loaded,
     normalize_query,
     warm as warm_ocr,
@@ -566,6 +567,220 @@ async def detect_stream(
         media_type="application/x-ndjson",
         headers={
             # Disable proxy buffering so events arrive incrementally.
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.post("/api/ocr/raw/stream")
+async def detect_raw_stream(
+    file: UploadFile = File(...),
+    frame_from: int = Form(1, ge=1),
+    frame_to: int | None = Form(None),
+    fps: float | None = Form(None),
+    dedup_threshold: int = Form(2),
+    max_gap: int = Form(1, ge=0, le=240),
+) -> StreamingResponse:
+    """Stream raw Textract responses across a frame range as NDJSON.
+
+    This endpoint is query-free and intended for prompt-mode planning /
+    detection where filtering happens upstream in TypeScript.
+    """
+    _validate_video(file)
+    t_req = time.perf_counter()
+    body = await file.read()
+    if not body:
+        raise HTTPException(status_code=400, detail="Empty file.")
+    if len(body) > _MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="File too large.")
+    if fps is not None and fps <= 0:
+        fps = None
+
+    log.info(
+        "stream raw: recv file=%r bytes=%d range=%s..%s fps=%s "
+        "dedup_threshold=%d max_gap=%d",
+        file.filename,
+        len(body),
+        frame_from,
+        frame_to,
+        fps,
+        dedup_threshold,
+        max_gap,
+    )
+
+    suffix = _guess_suffix(file.filename)
+    t_extract = time.perf_counter()
+    try:
+        frame_set, video_hash = get_or_extract(
+            body,
+            suffix=suffix,
+            fps=fps,
+            dedup_threshold=dedup_threshold,
+            max_gap=max_gap,
+        )
+    except FrameExtractionError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+    extract_ms = (time.perf_counter() - t_extract) * 1000
+
+    n = frame_set.kept_count
+    log.info(
+        "stream raw: video_hash=%s frames=%d (raw=%d) extract/cache=%.0fms",
+        video_hash[:12],
+        n,
+        frame_set.raw_count,
+        extract_ms,
+    )
+    if n == 0:
+        raise HTTPException(status_code=422, detail="No frames to process.")
+
+    lo_1 = max(1, frame_from)
+    hi_1 = frame_to if frame_to is not None else n
+    hi_1 = min(max(1, hi_1), n)
+    if lo_1 > hi_1:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid frame range: from={frame_from}, to={frame_to}",
+        )
+
+    selected_indices_1 = list(range(lo_1, hi_1 + 1))
+    selected = [(i_1, frame_set.frames[i_1 - 1]) for i_1 in selected_indices_1]
+
+    async def stream() -> AsyncIterator[bytes]:
+        yield _ndjson(
+            {
+                "type": "start",
+                "video_hash": video_hash,
+                "deduplicated_count": n,
+                "frame_from": lo_1,
+                "frame_to": hi_1,
+                "frame_indices": selected_indices_1,
+                "total": len(selected),
+            }
+        )
+
+        try:
+            t_load = time.perf_counter()
+            await asyncio.to_thread(ensure_reader_loaded)
+            log.info(
+                "stream raw: reader ready in %.0fms",
+                (time.perf_counter() - t_load) * 1000,
+            )
+        except Exception as e:  # pragma: no cover
+            log.exception("OCR reader load failed")
+            yield _ndjson({"type": "error", "message": f"OCR init failed: {e}"})
+            return
+
+        sem = asyncio.Semaphore(_STREAM_OCR_CONCURRENCY)
+        log.info(
+            "stream raw: fanning out %d frames (range %d..%d) concurrency=%d",
+            len(selected),
+            lo_1,
+            hi_1,
+            _STREAM_OCR_CONCURRENCY,
+        )
+
+        # Cache under query_norm="" so prompt-mode raw OCR shares the same
+        # LRU as detect/backtrack without colliding with query-filtered keys.
+        cache_entry = ocr_cache.create_entry(
+            video_hash=video_hash,
+            query_norm="",
+            fps=fps,
+            dedup_threshold=dedup_threshold,
+            max_gap=max_gap,
+            frame_from=lo_1,
+            frame_to=hi_1,
+        )
+
+        loop_t0 = time.perf_counter()
+        per_frame_ms: list[float] = []
+
+        async def run_one(idx_1: int, blob: bytes):
+            t_wait = time.perf_counter()
+            async with sem:
+                wait_ms = (time.perf_counter() - t_wait) * 1000
+                t_work = time.perf_counter()
+                width, height, raw = await asyncio.to_thread(detect_frame_raw, blob)
+                work_ms = (time.perf_counter() - t_work) * 1000
+                per_frame_ms.append(work_ms)
+                ocr_cache.put_frame(
+                    cache_entry,
+                    frame_idx_1=idx_1,
+                    width=width,
+                    height=height,
+                    matched=[],
+                    raw=raw,
+                )
+                log.info(
+                    "raw frame #%d: wait=%.0fms work=%.0fms",
+                    idx_1,
+                    wait_ms,
+                    work_ms,
+                )
+                return idx_1, width, height, raw
+
+        tasks = [asyncio.create_task(run_one(i, b)) for i, b in selected]
+        completed = 0
+        try:
+            for fut in asyncio.as_completed(tasks):
+                idx_1, width, height, raw = await fut
+                completed += 1
+                yield _ndjson(
+                    {
+                        "type": "frame",
+                        "index": idx_1,
+                        "width": width,
+                        "height": height,
+                        "raw": raw,
+                    }
+                )
+        except asyncio.CancelledError:
+            log.warning(
+                "stream raw: client disconnected after %d/%d frames",
+                completed,
+                len(selected),
+            )
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            raise
+        except Exception as e:  # pragma: no cover
+            log.exception("Streaming raw OCR failed")
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            yield _ndjson({"type": "error", "message": str(e)})
+            return
+
+        total_wall = time.perf_counter() - loop_t0
+        total_req = time.perf_counter() - t_req
+        if per_frame_ms:
+            per_frame_ms.sort()
+            mean = sum(per_frame_ms) / len(per_frame_ms)
+            p50 = per_frame_ms[len(per_frame_ms) // 2]
+            p95 = per_frame_ms[int(len(per_frame_ms) * 0.95)]
+            log.info(
+                "stream raw: done frames=%d ocr_wall=%.1fs req_wall=%.1fs "
+                "per_frame mean=%.0fms p50=%.0fms p95=%.0fms max=%.0fms "
+                "throughput=%.2f fps",
+                len(selected),
+                total_wall,
+                total_req,
+                mean,
+                p50,
+                p95,
+                max(per_frame_ms),
+                len(selected) / total_wall if total_wall > 0 else 0.0,
+            )
+        else:
+            log.info("stream raw: done frames=0 wall=%.1fs", total_wall)
+
+        yield _ndjson({"type": "done", "frames": completed})
+
+    return StreamingResponse(
+        stream(),
+        media_type="application/x-ndjson",
+        headers={
             "Cache-Control": "no-cache, no-transform",
             "X-Accel-Buffering": "no",
         },

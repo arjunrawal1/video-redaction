@@ -22,6 +22,7 @@
 
 import { curateFrame } from "@/lib/server/agentic-curator";
 import { aerr, alog } from "@/lib/server/agentic-log";
+import { applyShrinkInPlace, shrinkBoxesOnFrame } from "@/lib/server/box-shrink";
 import {
   linkFramePair,
   type LinkDecision,
@@ -34,9 +35,11 @@ import {
   geminiCost,
   textractCost,
 } from "@/lib/server/cost";
+import { annotateFrame } from "@/lib/server/frame-annotate";
 import { fetchDeduplicatedFramesServer } from "@/lib/server/frames";
 import {
   runGapFiller,
+  type InsertedFrame,
   type KeptFrameForGapFill,
 } from "@/lib/server/gap-filler";
 import {
@@ -639,6 +642,7 @@ export async function POST(req: Request): Promise<Response> {
     let gapCuratorUsd = 0;
     let gapLinkerUsd = 0;
     let gapInsertedCount = 0;
+    let gapInserts: InsertedFrame[] = [];
     try {
       // Gather each kept frame's current post-linker state. Boxes were
       // mutated in place (track_id stamped onto the ServerBox objects
@@ -679,6 +683,7 @@ export async function POST(req: Request): Promise<Response> {
           runLog,
         });
         runningUSD = runningRef.value;
+        gapInserts = gapResult.inserts;
         gapInsertedCount = gapResult.inserts.length;
         gapCuratorUsd = geminiCost(
           agenticModelId(),
@@ -726,6 +731,188 @@ export async function POST(req: Request): Promise<Response> {
       });
     }
     gapFillerElapsed = Date.now() - gapT0;
+
+    // ---- Phase 1.9: box-shrink post-processing -----------------------
+    // Curator, cascade/navigator, and prompt-mode tools all label each
+    // emitted box with the dominant text_color_hex + background_color_hex
+    // of the redacted region. We use those two colors to sample the
+    // frame's pixels at each of the box's 4 corners (small NxN window
+    // to absorb JPEG noise): any side whose 2 corners are BOTH closer
+    // to the background color than the text color is poking into
+    // margin and gets trimmed one pixel at a time until at least one
+    // corner on that side registers as text. See
+    // lib/server/box-shrink.ts for the full algorithm + safety caps.
+    //
+    // This pass runs AFTER every box-producing phase has settled
+    // (curator, linker, gap-filler) so a single walk over the cache
+    // tightens everything. Boxes on deterministic-fallback paths
+    // (missing colors) pass through untouched. Results are streamed
+    // via `post_process` events so any observing UI can replace its
+    // prior box geometry; the annotated-frame dump below also uses
+    // the tightened coords.
+    const shrinkT0 = Date.now();
+    let shrinkFramesProcessed = 0;
+    let shrinkBoxesChanged = 0;
+    let shrinkBoxesInspected = 0;
+    for (const idx1 of indices) {
+      const state = entry.perFrame[idx1];
+      if (!state || state.matched.length === 0) continue;
+      try {
+        const results = await shrinkBoxesOnFrame(state.blob, state.matched);
+        const changed = applyShrinkInPlace(results);
+        shrinkBoxesInspected += results.length;
+        shrinkBoxesChanged += changed;
+        shrinkFramesProcessed += 1;
+        if (changed > 0) {
+          runLog.write({
+            kind: "box_shrink_frame",
+            frame_index: idx1,
+            inspected: results.length,
+            changed,
+            deltas: results
+              .filter((r) => r.changed)
+              .map((r) => ({
+                text: r.box.text,
+                trimmed: r.trimmed,
+                reason: r.reason,
+                text_color_hex: r.box.text_color_hex,
+                background_color_hex: r.box.background_color_hex,
+              })),
+          });
+          emit({
+            type: "post_process",
+            phase: "box_shrink",
+            index: idx1,
+            width: state.width,
+            height: state.height,
+            boxes: state.matched.map((b) => ({
+              x: b.x,
+              y: b.y,
+              w: b.w,
+              h: b.h,
+              text: b.text,
+              score: Math.round((b.score ?? 1) * 1000) / 1000,
+              origin: b.origin,
+              track_id: b.track_id,
+              text_color_hex: b.text_color_hex,
+              background_color_hex: b.background_color_hex,
+            })),
+          });
+        }
+      } catch (e) {
+        aerr(`box shrink failed for kept idx=${idx1}`, e);
+      }
+    }
+    for (const ins of gapInserts) {
+      try {
+        const results = await shrinkBoxesOnFrame(ins.jpeg, ins.boxes);
+        const changed = applyShrinkInPlace(results);
+        shrinkBoxesInspected += results.length;
+        shrinkBoxesChanged += changed;
+        if (changed > 0) {
+          runLog.write({
+            kind: "box_shrink_gap_insert",
+            source_index: ins.sourceIndex,
+            between_kept_indices: ins.betweenKeptIndices,
+            inspected: results.length,
+            changed,
+          });
+        }
+      } catch (e) {
+        aerr(
+          `box shrink failed for gap-insert src=${ins.sourceIndex}`,
+          e,
+        );
+      }
+    }
+    const shrinkElapsed = Date.now() - shrinkT0;
+    alog("detect route box_shrink done", {
+      frames_processed: shrinkFramesProcessed,
+      boxes_inspected: shrinkBoxesInspected,
+      boxes_changed: shrinkBoxesChanged,
+      elapsed_ms: shrinkElapsed,
+    });
+    runLog.write({
+      kind: "box_shrink_summary",
+      frames_processed: shrinkFramesProcessed,
+      boxes_inspected: shrinkBoxesInspected,
+      boxes_changed: shrinkBoxesChanged,
+      elapsed_ms: shrinkElapsed,
+    });
+
+    // ---- Annotated-frame dump ----------------------------------------
+    // After every box-producing phase has settled, render each frame
+    // with its final set of redaction rectangles drawn on top and
+    // write the result to `<runId>-frames/` for visual review.
+    // Failures are best-effort: we log and skip a frame rather than
+    // aborting the whole run — annotation is a debug artifact.
+    if (runLog.enabled && runLog.framesDir) {
+      const annotateT0 = Date.now();
+      const padWidth = Math.max(3, String(hi).length);
+      const pad = (n: number): string => String(n).padStart(padWidth, "0");
+      let annotatedKept = 0;
+      for (const idx1 of indices) {
+        const state = entry.perFrame[idx1];
+        if (!state) continue;
+        try {
+          const annotated = await annotateFrame(
+            state.blob,
+            state.matched.map((b) => ({
+              x: b.x,
+              y: b.y,
+              w: b.w,
+              h: b.h,
+              label: b.text,
+              origin: b.origin ?? "ocr",
+            })),
+          );
+          runLog.writeFrame(`frame-${pad(idx1)}.jpg`, annotated);
+          annotatedKept += 1;
+        } catch (e) {
+          aerr(`annotated frame dump failed for idx=${idx1}`, e);
+        }
+      }
+      let annotatedGap = 0;
+      for (const ins of gapInserts) {
+        try {
+          const annotated = await annotateFrame(
+            ins.jpeg,
+            ins.boxes.map((b) => ({
+              x: b.x,
+              y: b.y,
+              w: b.w,
+              h: b.h,
+              label: b.text,
+              origin: "gap-fill",
+            })),
+          );
+          const [a, b2] = ins.betweenKeptIndices;
+          runLog.writeFrame(
+            `gap-${pad(a)}-${pad(b2)}-src${ins.sourceIndex}.jpg`,
+            annotated,
+          );
+          annotatedGap += 1;
+        } catch (e) {
+          aerr(
+            `annotated frame dump failed for gap-insert src=${ins.sourceIndex}`,
+            e,
+          );
+        }
+      }
+      alog("detect route annotated frames written", {
+        kept_written: annotatedKept,
+        gap_written: annotatedGap,
+        frames_dir: runLog.framesDir,
+        elapsed_ms: Date.now() - annotateT0,
+      });
+      runLog.write({
+        kind: "annotated_frames_written",
+        kept_written: annotatedKept,
+        gap_written: annotatedGap,
+        frames_dir: runLog.framesDir,
+        elapsed_ms: Date.now() - annotateT0,
+      });
+    }
 
     const elapsed = curatorElapsed + linkerElapsed + gapFillerElapsed;
 

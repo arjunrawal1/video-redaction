@@ -11,8 +11,8 @@ import {
   createEntry,
   getEntry,
   putFrame,
-  type CacheEntry,
   type FrameState,
+  type QueryCacheEntry,
 } from "./gemini-cache";
 import { fetchDeduplicatedFramesServer, type ServerFrame } from "./frames";
 import { runPass, type PassDirection } from "./pass-driver";
@@ -189,7 +189,7 @@ async function populatePhase1(opts: {
   maxGap: number;
   lo: number;
   hi: number;
-}): Promise<CacheEntry> {
+}): Promise<QueryCacheEntry> {
   const entry = createEntry({
     engine: "gemini",
     videoHash: opts.framesRes.videoHash,

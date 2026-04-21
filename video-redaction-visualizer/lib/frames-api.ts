@@ -75,6 +75,10 @@ export type DetectionBox = {
   // event did; the existing assignLabels fallback still produces
   // letter labels in that case.
   track_id?: string;
+  // Prompt-mode only metadata.
+  instance_id?: string;
+  branch?: string;
+  category?: string;
 };
 
 export type DetectionFrame = {
@@ -259,7 +263,8 @@ export type StreamDetectOptions = {
   // "ocr"     → Python backend /api/ocr/*      (default)
   // "gemini"  → Next.js route   /api/gemini/*   (same-origin, Vercel AI SDK)
   // "teamwork"→ Next.js route   /api/teamwork/* (OCR + Gemini cooperation)
-  engine?: "ocr" | "gemini" | "teamwork";
+  // "prompt"  → Next.js route   /api/prompt/*   (predicate-driven intent)
+  engine?: "ocr" | "gemini" | "teamwork" | "prompt";
 };
 
 export type BacktrackStartEvent = {
@@ -434,13 +439,16 @@ type PassName = "detect/stream" | "backtrack" | "forward" | "navigate";
 
 function passUrl(
   pass: PassName,
-  engine: "ocr" | "gemini" | "teamwork" | undefined,
+  engine: "ocr" | "gemini" | "teamwork" | "prompt" | undefined,
 ): string {
   if (engine === "gemini") {
     return `/api/gemini/${pass}`;
   }
   if (engine === "teamwork") {
     return `/api/teamwork/${pass}`;
+  }
+  if (engine === "prompt") {
+    return `/api/prompt/${pass}`;
   }
   // OCR doesn't have a navigate phase; callers should only request it
   // for the teamwork engine. Fall back to the OCR base if somehow reached
@@ -607,6 +615,112 @@ export async function streamNavigate(
   const form = buildDetectForm(file, query, opts);
   return streamNdjson<NavigateEvent>(
     passUrl("navigate", opts.engine ?? "teamwork"),
+    form,
+    onEvent,
+    signal,
+  );
+}
+
+// --- Prompt-mode helpers --------------------------------------------------
+
+export type PromptPlanResponse = {
+  session_id: string;
+  prompt: string;
+  predicate: unknown;
+  hash?: string;
+  sample_frame_indices?: number[];
+  run_log_path?: string;
+};
+
+export type PromptStreamOptions = StreamDetectOptions & {
+  predicateJson: string;
+  predicateHash?: string;
+};
+
+function buildPromptDetectForm(
+  file: File,
+  prompt: string,
+  opts: PromptStreamOptions,
+): FormData {
+  const form = new FormData();
+  form.append("file", file);
+  form.append("prompt", prompt);
+  form.append("predicate_json", opts.predicateJson);
+  if (opts.predicateHash) form.append("predicate_hash", opts.predicateHash);
+  if (opts.frameFrom != null) form.append("frame_from", String(opts.frameFrom));
+  if (opts.frameTo != null) form.append("frame_to", String(opts.frameTo));
+  if (opts.fps != null) form.append("fps", String(opts.fps));
+  if (opts.dedupThreshold != null) {
+    form.append("dedup_threshold", String(opts.dedupThreshold));
+  }
+  if (opts.maxGap != null) {
+    form.append("max_gap", String(opts.maxGap));
+  }
+  return form;
+}
+
+export async function streamPromptPlan(
+  file: File,
+  prompt: string,
+  opts: {
+    frameFrom?: number;
+    frameTo?: number;
+    fps?: number;
+    dedupThreshold?: number;
+    maxGap?: number;
+  } = {},
+  signal?: AbortSignal,
+): Promise<PromptPlanResponse> {
+  const form = new FormData();
+  form.append("file", file);
+  form.append("prompt", prompt);
+  if (opts.frameFrom != null) form.append("frame_from", String(opts.frameFrom));
+  if (opts.frameTo != null) form.append("frame_to", String(opts.frameTo));
+  if (opts.fps != null) form.append("fps", String(opts.fps));
+  if (opts.dedupThreshold != null) {
+    form.append("dedup_threshold", String(opts.dedupThreshold));
+  }
+  if (opts.maxGap != null) {
+    form.append("max_gap", String(opts.maxGap));
+  }
+  const res = await fetch("/api/prompt/plan", {
+    method: "POST",
+    body: form,
+    signal,
+  });
+  const text = await res.text();
+  if (!res.ok) {
+    throw new Error(parseErrorBody(text) || `HTTP ${res.status}`);
+  }
+  return JSON.parse(text) as PromptPlanResponse;
+}
+
+export async function streamPromptDetect(
+  file: File,
+  prompt: string,
+  opts: PromptStreamOptions,
+  onEvent: (event: DetectEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const form = buildPromptDetectForm(file, prompt, opts);
+  return streamNdjson<DetectEvent>(
+    passUrl("detect/stream", "prompt"),
+    form,
+    onEvent,
+    signal,
+  );
+}
+
+export async function streamPromptNavigate(
+  file: File,
+  prompt: string,
+  opts: PromptStreamOptions,
+  onEvent: (event: NavigateEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const form = buildPromptDetectForm(file, prompt, opts);
+  return streamNdjson<NavigateEvent>(
+    passUrl("navigate", "prompt"),
     form,
     onEvent,
     signal,

@@ -9,9 +9,13 @@ import {
   streamDetect,
   streamForward,
   streamNavigate,
+  streamPromptPlan,
+  streamPromptDetect,
+  streamPromptNavigate,
   type DeduplicatedFramesResponse,
   type DetectionFrame,
   type ExportBoxRect,
+  type PromptPlanResponse,
 } from "@/lib/frames-api";
 import { assignLabels, type FrameLabelMap } from "@/lib/labeling";
 
@@ -197,6 +201,7 @@ function FrameLightbox({
   onCopyOcr: (frameNumber: number) => void;
   copiedFrameNumber: number | null;
 }) {
+  /* eslint-disable react-hooks/set-state-in-effect */
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") onClose();
@@ -330,10 +335,10 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
   const [frameFrom, setFrameFrom] = useState<number>(1);
   const [frameTo, setFrameTo] = useState<number>(1);
   // "ocr"      → Python backend (Textract).
-  // "gemini"   → Next.js routes (OpenRouter + Vercel AI SDK).
+  // "gemini"   → Next.js routes (Vertex AI Gemini 2.5 via Vercel AI SDK).
   // "teamwork" → Agentic: parallel per-frame curator + tool-calling
   //              navigator. Gemini 3 Pro is the ultimate decision maker.
-  const [engine, setEngine] = useState<"ocr" | "gemini" | "teamwork">("ocr");
+  const [engine, setEngine] = useState<"ocr" | "gemini" | "teamwork" | "prompt">("ocr");
   const [firstPassColor, setFirstPassColor] = useState<string>(
     DEFAULT_FIRST_PASS_COLOR,
   );
@@ -391,6 +396,11 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
   const [navEvents, setNavEvents] = useState<
     Array<{ id: number; step: number; label: string }>
   >([]);
+  // Prompt engine planning state (predicate only; prompt mode never asks
+  // for clarifications — the planner makes a best-informed interpretation
+  // from the prompt + scene context).
+  const [planningPrompt, setPlanningPrompt] = useState(false);
+  const [promptSession, setPromptSession] = useState<PromptPlanResponse | null>(null);
 
   // Running cost tracker. Updated live from server `cost_update` events
   // during both detect and navigate routes, sealed by `cost_final`.
@@ -478,6 +488,8 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
     setNavStats(null);
     setNavTouched([]);
     setNavEvents([]);
+    setPlanningPrompt(false);
+    setPromptSession(null);
     setExporting(false);
     setExportError(null);
     setExportUrl((prev) => {
@@ -499,6 +511,7 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
       setFrameTo(totalFrames);
     }
   }, [totalFrames]);
+  /* eslint-enable react-hooks/set-state-in-effect */
 
   const frameLabels: FrameLabelMap = useMemo(() => {
     if (totalFrames <= 0) return {};
@@ -541,11 +554,22 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
     };
   }, [detections]);
 
+  const promptReady =
+    promptSession != null &&
+    typeof promptSession.hash === "string" &&
+    promptSession.hash.length > 0;
+
   const onDetect = useCallback(
     async (e: React.FormEvent) => {
       e.preventDefault();
       const q = query.trim();
-      if (!q || !totalFrames) return;
+      if (!totalFrames) return;
+      const hasPlannedPrompt =
+        promptSession != null &&
+        typeof promptSession.hash === "string" &&
+        promptSession.hash.length > 0;
+      if (engine !== "prompt" && !q) return;
+      if (engine === "prompt" && !q && !hasPlannedPrompt) return;
 
       const from = Math.max(1, Math.min(totalFrames, Math.floor(frameFrom)));
       const to = Math.max(from, Math.min(totalFrames, Math.floor(frameTo)));
@@ -587,6 +611,251 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
         for (let i = from; i <= to; i++) delete next[i];
         return next;
       });
+
+      if (currentEngine === "prompt") {
+        try {
+          setPlanningPrompt(true);
+          let session: PromptPlanResponse | null = promptSession;
+          const shouldReplan =
+            !session ||
+            session.prompt !== q ||
+            !session.hash ||
+            !session.predicate;
+
+          if (shouldReplan) {
+            if (!q) {
+              setDetectError("Enter a prompt to build a predicate plan.");
+              return;
+            }
+            session = await streamPromptPlan(
+              file,
+              q,
+              { frameFrom: from, frameTo: to },
+              ac.signal,
+            );
+            setPromptSession(session);
+          }
+
+          if (!session) {
+            setDetectError("Failed to initialize prompt session.");
+            return;
+          }
+
+          const activeSession: PromptPlanResponse = session;
+
+          if (!activeSession.hash || !activeSession.predicate) {
+            setDetectError("Prompt plan missing predicate hash.");
+            return;
+          }
+
+          setPlanningPrompt(false);
+
+          let phase1Ok = false;
+          await streamPromptDetect(
+            file,
+            q || activeSession.prompt,
+            {
+              frameFrom: from,
+              frameTo: to,
+              predicateJson: JSON.stringify(activeSession.predicate),
+              predicateHash: activeSession.hash,
+              engine: "prompt",
+            },
+            (event) => {
+              if (event.type === "start") {
+                setRunProgress({
+                  processed: 0,
+                  total: event.total,
+                  from: event.frame_from,
+                  to: event.frame_to,
+                });
+              } else if (event.type === "frame") {
+                setDetections((prev) => ({
+                  ...prev,
+                  [event.index]: {
+                    detection: {
+                      width: event.width,
+                      height: event.height,
+                      boxes: event.boxes.map((b) => ({
+                        ...b,
+                        track_id: b.instance_id ?? b.track_id,
+                      })),
+                    },
+                    color: currentColor,
+                    raw: event.raw,
+                    flagged: Boolean(event.flagged),
+                  },
+                }));
+                setRunProgress((p) =>
+                  p ? { ...p, processed: p.processed + 1 } : p,
+                );
+              } else if (event.type === "done") {
+                phase1Ok = true;
+              } else if (event.type === "error") {
+                setDetectError(event.message);
+              }
+            },
+            ac.signal,
+          );
+
+          if (!phase1Ok || ac.signal.aborted) return;
+
+          const nac = new AbortController();
+          navigateAbortRef.current = nac;
+          setNavigating(true);
+          let nextEventId = 0;
+          try {
+            await streamPromptNavigate(
+              file,
+              q || activeSession.prompt,
+              {
+                frameFrom: from,
+                frameTo: to,
+                predicateJson: JSON.stringify(activeSession.predicate),
+                predicateHash: activeSession.hash,
+                engine: "prompt",
+              },
+              (event) => {
+                if (event.type === "frame_update") {
+                  setDetections((prev) => {
+                    const existing = prev[event.index];
+                    if (event.action === "add") {
+                      const incoming = {
+                        ...event.box,
+                        track_id: event.box.instance_id ?? event.box.track_id,
+                        origin: event.box.origin ?? ("fix" as const),
+                      };
+                      if (existing) {
+                        return {
+                          ...prev,
+                          [event.index]: {
+                            ...existing,
+                            backtrackColor: currentBackwardColor,
+                            detection: {
+                              ...existing.detection,
+                              boxes: existing.detection.boxes.some(
+                                (b) =>
+                                  b.x === incoming.x &&
+                                  b.y === incoming.y &&
+                                  b.w === incoming.w &&
+                                  b.h === incoming.h &&
+                                  b.origin === incoming.origin,
+                              )
+                                ? existing.detection.boxes
+                                : [...existing.detection.boxes, incoming],
+                            },
+                          },
+                        };
+                      }
+                      return {
+                        ...prev,
+                        [event.index]: {
+                          detection: {
+                            width: 0,
+                            height: 0,
+                            boxes: [incoming],
+                          },
+                          color: currentColor,
+                          backtrackColor: currentBackwardColor,
+                        },
+                      };
+                    }
+                    if (!existing) return prev;
+                    return {
+                      ...prev,
+                      [event.index]: {
+                        ...existing,
+                        detection: {
+                          ...existing.detection,
+                          boxes: existing.detection.boxes.filter(
+                            (b) =>
+                              !(
+                                b.x === event.box.x &&
+                                b.y === event.box.y &&
+                                b.w === event.box.w &&
+                                b.h === event.box.h
+                              ),
+                          ),
+                        },
+                      },
+                    };
+                  });
+                  setNavTouched((prev) =>
+                    prev.includes(event.index) ? prev : [...prev, event.index],
+                  );
+                } else if (event.type === "tool_call") {
+                  const label = formatToolCall(event.name, event.input);
+                  const id = nextEventId++;
+                  setNavEvents((prev) =>
+                    [...prev, { id, step: event.step, label }].slice(-30),
+                  );
+                } else if (event.type === "tool_result") {
+                  const id = nextEventId++;
+                  setNavEvents((prev) =>
+                    [
+                      ...prev,
+                      {
+                        id,
+                        step: event.step,
+                        label: `↳ ${event.summary}`,
+                      },
+                    ].slice(-30),
+                  );
+                } else if (event.type === "model_text") {
+                  const id = nextEventId++;
+                  setNavEvents((prev) =>
+                    [
+                      ...prev,
+                      {
+                        id,
+                        step: event.step,
+                        label: `💭 ${event.text.slice(0, 140)}${event.text.length > 140 ? "…" : ""}`,
+                      },
+                    ].slice(-30),
+                  );
+                } else if (event.type === "finish") {
+                  setNavStats((prev) => ({
+                    steps: event.total_steps,
+                    added: prev?.added ?? 0,
+                    removed: prev?.removed ?? 0,
+                    finishSummary: event.summary,
+                  }));
+                } else if (event.type === "done") {
+                  setNavStats((prev) => ({
+                    steps: event.total_steps,
+                    added: event.added_boxes,
+                    removed: event.removed_boxes,
+                    finishSummary: prev?.finishSummary ?? null,
+                  }));
+                } else if (event.type === "error") {
+                  setDetectError(event.message);
+                }
+              },
+              nac.signal,
+            );
+          } catch (err) {
+            if (!nac.signal.aborted) {
+              setDetectError(
+                err instanceof Error ? err.message : "Prompt navigate failed.",
+              );
+            }
+          } finally {
+            if (!nac.signal.aborted) setNavigating(false);
+          }
+        } catch (err) {
+          if (!ac.signal.aborted) {
+            setDetectError(
+              err instanceof Error ? err.message : "Prompt planning/detect failed.",
+            );
+          }
+        } finally {
+          if (!ac.signal.aborted) {
+            setPlanningPrompt(false);
+            setDetecting(false);
+          }
+        }
+        return;
+      }
 
       // --- Phase 1: detect --------------------------------------------------
       let phase1Ok = false;
@@ -631,7 +900,10 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
                   detection: {
                     width: event.width,
                     height: event.height,
-                    boxes: event.boxes,
+                    boxes: event.boxes.map((b) => ({
+                      ...b,
+                      track_id: b.instance_id ?? b.track_id,
+                    })),
                   },
                   color: currentColor,
                   raw: event.raw,
@@ -722,6 +994,7 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
                   if (event.action === "add") {
                     const incoming = {
                       ...event.box,
+                      track_id: event.box.instance_id ?? event.box.track_id,
                       origin: event.box.origin ?? ("fix" as const),
                     };
                     if (existing) {
@@ -1007,6 +1280,7 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
       forwardPassColor,
       engine,
       totalFrames,
+      promptSession,
     ],
   );
 
@@ -1019,6 +1293,7 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
     setBacktracking(false);
     setForwarding(false);
     setNavigating(false);
+    setPlanningPrompt(false);
   }, []);
 
   const onClearDetection = useCallback(() => {
@@ -1041,6 +1316,8 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
     setNavStats(null);
     setNavTouched([]);
     setNavEvents([]);
+    setPlanningPrompt(false);
+    setPromptSession(null);
     setRunProgress(null);
     setExporting(false);
     setExportError(null);
@@ -1217,15 +1494,35 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
         <label htmlFor={queryInputId} className="sr-only">
           Text to redact
         </label>
-        <input
-          id={queryInputId}
-          type="text"
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          placeholder="Text to find and redact (e.g. an email, a name)"
-          disabled={detecting || backtracking || forwarding || navigating || loading || !framesResult}
-          className="min-w-56 flex-1 rounded-md border border-border bg-background px-3 py-1.5 text-sm text-foreground outline-none placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-sky-500 disabled:opacity-60"
-        />
+        {engine === "prompt" ? (
+          <textarea
+            id={queryInputId}
+            rows={2}
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Describe what to redact (literal text, cells, employee info, PII, combinations)"
+            disabled={
+              detecting ||
+              backtracking ||
+              forwarding ||
+              navigating ||
+              planningPrompt ||
+              loading ||
+              !framesResult
+            }
+            className="min-w-56 flex-1 rounded-md border border-border bg-background px-3 py-1.5 text-sm text-foreground outline-none placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-sky-500 disabled:opacity-60"
+          />
+        ) : (
+          <input
+            id={queryInputId}
+            type="text"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Text to find and redact (e.g. an email, a name)"
+            disabled={detecting || backtracking || forwarding || navigating || planningPrompt || loading || !framesResult}
+            className="min-w-56 flex-1 rounded-md border border-border bg-background px-3 py-1.5 text-sm text-foreground outline-none placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-sky-500 disabled:opacity-60"
+          />
+        )}
 
         <div className="flex items-center gap-1 rounded-md border border-border bg-background px-2 py-1 text-xs text-muted-foreground">
           <label htmlFor={fromInputId} className="sr-only">
@@ -1243,7 +1540,7 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
               const v = Number(e.target.value);
               setFrameFrom(Number.isFinite(v) ? v : 1);
             }}
-            disabled={detecting || backtracking || forwarding || navigating || loading || !framesResult}
+            disabled={detecting || backtracking || forwarding || navigating || planningPrompt || loading || !framesResult}
             className="w-14 bg-transparent text-foreground outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
           />
           <span aria-hidden="true" className="text-muted-foreground">
@@ -1263,7 +1560,7 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
               const v = Number(e.target.value);
               setFrameTo(Number.isFinite(v) ? v : 1);
             }}
-            disabled={detecting || backtracking || forwarding || navigating || loading || !framesResult}
+            disabled={detecting || backtracking || forwarding || navigating || planningPrompt || loading || !framesResult}
             className="w-14 bg-transparent text-foreground outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
           />
           <span className="ml-1 text-[10px] text-muted-foreground">
@@ -1272,7 +1569,7 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
           <button
             type="button"
             onClick={selectFullRange}
-            disabled={detecting || backtracking || forwarding || navigating || loading || !totalFrames}
+            disabled={detecting || backtracking || forwarding || navigating || planningPrompt || loading || !totalFrames}
             className="ml-1 rounded px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-40"
             title="Set range to all frames"
           >
@@ -1295,7 +1592,7 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
               type="color"
               value={firstPassColor}
               onChange={(e) => setFirstPassColor(e.target.value)}
-              disabled={detecting || backtracking || forwarding || navigating}
+              disabled={detecting || backtracking || forwarding || navigating || planningPrompt}
               className="h-5 w-6 cursor-pointer appearance-none rounded border border-border bg-transparent p-0 disabled:opacity-50"
             />
           </label>
@@ -1310,7 +1607,7 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
               type="color"
               value={backwardPassColor}
               onChange={(e) => setBackwardPassColor(e.target.value)}
-              disabled={detecting || backtracking || forwarding || navigating}
+              disabled={detecting || backtracking || forwarding || navigating || planningPrompt}
               className="h-5 w-6 cursor-pointer appearance-none rounded border border-border bg-transparent p-0 disabled:opacity-50"
             />
           </label>
@@ -1325,7 +1622,7 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
               type="color"
               value={forwardPassColor}
               onChange={(e) => setForwardPassColor(e.target.value)}
-              disabled={detecting || backtracking || forwarding || navigating}
+              disabled={detecting || backtracking || forwarding || navigating || planningPrompt}
               className="h-5 w-6 cursor-pointer appearance-none rounded border border-border bg-transparent p-0 disabled:opacity-50"
             />
           </label>
@@ -1336,16 +1633,24 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
           aria-label="Detection engine"
           className="inline-flex overflow-hidden rounded-md border border-border text-xs"
         >
-          {(["ocr", "gemini", "teamwork"] as const).map((k) => {
+          {(["ocr", "gemini", "teamwork", "prompt"] as const).map((k) => {
             const active = engine === k;
             const label =
-              k === "ocr" ? "OCR" : k === "gemini" ? "Gemini" : "Agentic";
+              k === "ocr"
+                ? "OCR"
+                : k === "gemini"
+                  ? "Gemini"
+                  : k === "teamwork"
+                    ? "Agentic"
+                    : "Prompt";
             const title =
               k === "ocr"
                 ? "Textract OCR via Python backend"
                 : k === "gemini"
-                  ? "OpenRouter (Gemini 2.5) via Vercel AI SDK"
-                  : "Agentic: Gemini 3 Flash (direct) — per-frame curator + bi-directional cascade navigator with code-execution tool for image zoom";
+                  ? "Vertex AI (Gemini 2.5) via Vercel AI SDK"
+                  : k === "teamwork"
+                    ? "Agentic: Gemini 3 Flash (direct) — per-frame curator + bi-directional cascade navigator with code-execution tool for image zoom"
+                    : "Prompt predicate mode: natural-language intent planning + instance-aware detect/navigate";
             return (
               <button
                 key={k}
@@ -1353,7 +1658,7 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
                 onClick={() => setEngine(k)}
                 aria-pressed={active}
                 disabled={
-                  detecting || backtracking || forwarding || navigating
+                  detecting || backtracking || forwarding || navigating || planningPrompt
                 }
                 title={title}
                 className={[
@@ -1369,7 +1674,7 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
           })}
         </div>
 
-        {detecting || backtracking || forwarding || navigating ? (
+        {detecting || backtracking || forwarding || navigating || planningPrompt ? (
           <button
             type="button"
             onClick={onCancel}
@@ -1380,14 +1685,24 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
         ) : (
           <button
             type="submit"
-            disabled={loading || !framesResult || !query.trim()}
+            disabled={
+              loading ||
+              !framesResult ||
+              (engine === "prompt"
+                ? !(query.trim() || promptReady)
+                : !query.trim())
+            }
             className="rounded-md bg-foreground px-3 py-1.5 text-sm font-medium text-background transition-opacity hover:opacity-90 disabled:opacity-50"
           >
-            {stats.covered > 0 ? "Re-run range" : "Detect"}
+            {planningPrompt
+              ? "Planning…"
+              : stats.covered > 0
+                ? "Re-run range"
+                : "Detect"}
           </button>
         )}
 
-        {stats.covered > 0 && !detecting && !backtracking && !forwarding && !navigating && (
+        {stats.covered > 0 && !detecting && !backtracking && !forwarding && !navigating && !planningPrompt && (
           <button
             type="button"
             onClick={onClearDetection}
@@ -1397,6 +1712,41 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
           </button>
         )}
       </form>
+
+      {engine === "prompt" && promptSession && (
+        <div className="rounded-lg border border-border bg-background/60 p-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <p className="text-xs text-muted-foreground">
+              Prompt session{" "}
+              <span className="font-mono text-foreground">
+                {promptSession.session_id.slice(0, 8)}
+              </span>
+              {promptSession.sample_frame_indices &&
+                promptSession.sample_frame_indices.length > 0 && (
+                  <>
+                    {" "}
+                    · sampled frames{" "}
+                    <span className="font-mono text-foreground">
+                      {promptSession.sample_frame_indices.join(", ")}
+                    </span>
+                  </>
+                )}
+            </p>
+            {promptReady && (
+              <span className="rounded bg-emerald-500/15 px-2 py-0.5 text-[11px] font-medium text-emerald-700 dark:text-emerald-300">
+                Parsed predicate ready
+              </span>
+            )}
+          </div>
+
+          <p className="mt-2 text-xs text-muted-foreground">
+            Parsed predicate hash:{" "}
+            <span className="font-mono text-foreground">
+              {promptSession.hash?.slice(0, 16) ?? "—"}
+            </span>
+          </p>
+        </div>
+      )}
 
       {(stats.covered > 0 || lastQuery) && !detectError && (
         <p className="text-xs text-muted-foreground">
@@ -1496,6 +1846,12 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
         <p className="text-xs text-muted-foreground" aria-live="polite">
           Streaming OCR · frames {runProgress.from}–{runProgress.to} ·{" "}
           {runProgress.processed}/{runProgress.total} processed
+        </p>
+      )}
+
+      {planningPrompt && (
+        <p className="text-xs text-muted-foreground" aria-live="polite">
+          Planning predicate from prompt…
         </p>
       )}
 

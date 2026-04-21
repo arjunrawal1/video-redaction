@@ -1,4 +1,4 @@
-// Agentic second pass: the navigator (GPT-5.4 via OpenRouter).
+// Agentic second pass: the navigator (Gemini 3 via Vertex AI).
 //
 // Given the curator's per-frame output (hits + rejected OCR candidates),
 // we hand the whole session to GPT-5.4 as a tool-calling agent. The
@@ -23,6 +23,7 @@
 import { generateText, stepCountIs, tool, type LanguageModelUsage } from "ai";
 import { z } from "zod";
 import { aerr, alog } from "./agentic-log";
+import { normalizeHexColor } from "./box-shrink";
 import { geminiCost } from "./cost";
 import { resolveFixTrackId } from "./linker-fallback";
 import {
@@ -187,6 +188,7 @@ function system(): string {
     "  - `finish(summary)` — terminate once every frame is correctly redacted.",
     BOX_FORMAT_NOTE,
     "Prefer tight boxes that wrap just the query text. Do not over-redact whole rows.",
+    "For EVERY call to `add_box` and `adopt_ocr_box`, you MUST label `text_color_hex` (dominant color of the text glyphs, hex RGB like '#111111') AND `background_color_hex` (dominant color of the surrounding / inter-glyph pixels, like '#ffffff'). These drive a deterministic pixel-level shrink pass that tightens boxes whose corners poke into margin — if you guess the colors wrong, the pass either over-shrinks or no-ops. Be deliberate.",
     "Reuse OCR rectangles whenever possible. Use `adopt_ocr_box` when a filtered candidate already exists, and `get_ocr_text` to find bboxes for partials or garbled hits that didn't make it past the fuzzy filter. The on-screen content may SCROLL across frames, so DO NOT blindly copy coordinates from one frame to another — confirm with `get_frame` or `get_ocr_text` on the target frame first.",
     "Call `finish` when no further edits are needed. Do not call it before inspecting any frames that appear suspicious.",
   ].join("\n");
@@ -318,7 +320,7 @@ export async function runNavigator(opts: {
 
   const addBoxTool = tool({
     description:
-      "Add a new redaction box to a frame using Gemini's native box_2d format: [y_min, x_min, y_max, x_max] in 0..1000 (top-left origin). Returns the new hit_id.",
+      "Add a new redaction box to a frame using Gemini's native box_2d format: [y_min, x_min, y_max, x_max] in 0..1000 (top-left origin). Returns the new hit_id. You MUST also label `text_color_hex` + `background_color_hex` — the dominant color of the text glyphs and the dominant color of the surrounding background, each as a 6-digit hex RGB string (e.g. '#111111', '#ffffff'). Those colors feed the downstream pixel-level shrink pass that tightens boxes whose corners poke into margin.",
     inputSchema: z.object({
       frame_index: z.number().int(),
       text: z.string().describe("The visible on-screen text being redacted."),
@@ -326,13 +328,35 @@ export async function runNavigator(opts: {
       x_min: z.number().int().min(0).max(1000),
       y_max: z.number().int().min(0).max(1000),
       x_max: z.number().int().min(0).max(1000),
+      text_color_hex: z
+        .string()
+        .describe(
+          "Dominant hex color of the TEXT GLYPHS inside the box, as 6-digit RGB (e.g. '#111111').",
+        ),
+      background_color_hex: z
+        .string()
+        .describe(
+          "Dominant hex color of the background around/between the glyphs, as 6-digit RGB (e.g. '#ffffff').",
+        ),
       reason: z.string().optional(),
     }),
-    execute: async ({ frame_index, text, y_min, x_min, y_max, x_max, reason }) => {
+    execute: async ({
+      frame_index,
+      text,
+      y_min,
+      x_min,
+      y_max,
+      x_max,
+      text_color_hex,
+      background_color_hex,
+      reason,
+    }) => {
       alog(`tool add_box invoked`, {
         frame_index,
         text,
         box_2d: [y_min, x_min, y_max, x_max],
+        text_color_hex,
+        background_color_hex,
         reason,
       });
       const f = frameByIndex.get(frame_index);
@@ -351,6 +375,8 @@ export async function runNavigator(opts: {
         origin: "fix",
         hit_id: mintHitId(),
         reason: reason ?? undefined,
+        text_color_hex: normalizeHexColor(text_color_hex),
+        background_color_hex: normalizeHexColor(background_color_hex),
       };
       hit.track_id = trackIdForFix({ hit, frame: f });
       f.hits.push(hit);
@@ -414,15 +440,39 @@ export async function runNavigator(opts: {
 
   const adoptOcrTool = tool({
     description:
-      "Promote an OCR candidate rectangle to a real hit. Useful when you want to reuse a tight OCR box rather than describe a new rectangle from scratch.",
+      "Promote an OCR candidate rectangle to a real hit. Useful when you want to reuse a tight OCR box rather than describe a new rectangle from scratch. You MUST also label `text_color_hex` + `background_color_hex` — the dominant color of the text glyphs and the dominant color of the surrounding background — each as a 6-digit hex RGB string. Those colors feed the downstream pixel-level shrink pass.",
     inputSchema: z.object({
       frame_index: z.number().int(),
       ocr_index: z.number().int(),
       text: z.string().optional(),
+      text_color_hex: z
+        .string()
+        .describe(
+          "Dominant hex color of the TEXT GLYPHS inside the OCR box, as 6-digit RGB (e.g. '#111111').",
+        ),
+      background_color_hex: z
+        .string()
+        .describe(
+          "Dominant hex color of the background around/between the glyphs, as 6-digit RGB (e.g. '#ffffff').",
+        ),
       reason: z.string().optional(),
     }),
-    execute: async ({ frame_index, ocr_index, text, reason }) => {
-      alog(`tool adopt_ocr_box invoked`, { frame_index, ocr_index, text, reason });
+    execute: async ({
+      frame_index,
+      ocr_index,
+      text,
+      text_color_hex,
+      background_color_hex,
+      reason,
+    }) => {
+      alog(`tool adopt_ocr_box invoked`, {
+        frame_index,
+        ocr_index,
+        text,
+        text_color_hex,
+        background_color_hex,
+        reason,
+      });
       const f = frameByIndex.get(frame_index);
       if (!f) return { ok: false as const, error: `Unknown frame ${frame_index}` };
       const src = f.ocrBoxes[ocr_index];
@@ -444,6 +494,8 @@ export async function runNavigator(opts: {
         origin: "fix",
         hit_id: mintHitId(),
         reason: reason ?? undefined,
+        text_color_hex: normalizeHexColor(text_color_hex),
+        background_color_hex: normalizeHexColor(background_color_hex),
       };
       hit.track_id = trackIdForFix({ hit, frame: f });
       f.hits.push(hit);

@@ -29,6 +29,8 @@ import {
   geminiCost,
   type AggregateUsage,
 } from "@/lib/server/cost";
+import { applyShrinkInPlace, shrinkBoxesOnFrame } from "@/lib/server/box-shrink";
+import { annotateFrame } from "@/lib/server/frame-annotate";
 import { fetchDeduplicatedFramesServer } from "@/lib/server/frames";
 import { getEntry } from "@/lib/server/gemini-cache";
 import { agenticModelId, agenticNavMode } from "@/lib/server/openrouter";
@@ -344,6 +346,130 @@ export async function POST(req: Request): Promise<Response> {
         const f = entry.perFrame[nf.index];
         if (!f) continue;
         f.matched = nf.hits.map(({ hit_id: _hit_id, ...rest }) => rest);
+      }
+
+      // ---- Box-shrink post-processing -------------------------------
+      // Every add_box / adopt_ocr_box tool call from the navigator
+      // (single or cascade) stamps text_color_hex + background_color_hex
+      // onto the emitted box. We use those to sample corner pixels on
+      // each frame and iteratively trim any side whose 2 corners both
+      // read as background. See lib/server/box-shrink.ts. Runs once
+      // post-navigate so the annotated-frame dump and cache state
+      // reflect tightened coords.
+      const shrinkT0 = Date.now();
+      let shrinkFramesProcessed = 0;
+      let shrinkBoxesChanged = 0;
+      let shrinkBoxesInspected = 0;
+      for (let idx1 = lo; idx1 <= hi; idx1++) {
+        const state = entry.perFrame[idx1];
+        if (!state || state.matched.length === 0) continue;
+        try {
+          const results = await shrinkBoxesOnFrame(
+            state.blob,
+            state.matched,
+          );
+          const changed = applyShrinkInPlace(results);
+          shrinkBoxesInspected += results.length;
+          shrinkBoxesChanged += changed;
+          shrinkFramesProcessed += 1;
+          if (changed > 0) {
+            runLog.write({
+              kind: "box_shrink_frame",
+              frame_index: idx1,
+              inspected: results.length,
+              changed,
+              deltas: results
+                .filter((r) => r.changed)
+                .map((r) => ({
+                  text: r.box.text,
+                  trimmed: r.trimmed,
+                  reason: r.reason,
+                  text_color_hex: r.box.text_color_hex,
+                  background_color_hex: r.box.background_color_hex,
+                })),
+            });
+            emit({
+              type: "post_process",
+              phase: "box_shrink",
+              index: idx1,
+              width: state.width,
+              height: state.height,
+              boxes: state.matched.map((b) => ({
+                x: b.x,
+                y: b.y,
+                w: b.w,
+                h: b.h,
+                text: b.text,
+                score: Math.round((b.score ?? 1) * 1000) / 1000,
+                origin: b.origin,
+                track_id: b.track_id,
+                text_color_hex: b.text_color_hex,
+                background_color_hex: b.background_color_hex,
+              })),
+            });
+          }
+        } catch (e) {
+          aerr(`navigate box shrink failed for idx=${idx1}`, e);
+        }
+      }
+      alog("navigate route box_shrink done", {
+        frames_processed: shrinkFramesProcessed,
+        boxes_inspected: shrinkBoxesInspected,
+        boxes_changed: shrinkBoxesChanged,
+        elapsed_ms: Date.now() - shrinkT0,
+      });
+      runLog.write({
+        kind: "box_shrink_summary",
+        frames_processed: shrinkFramesProcessed,
+        boxes_inspected: shrinkBoxesInspected,
+        boxes_changed: shrinkBoxesChanged,
+        elapsed_ms: Date.now() - shrinkT0,
+      });
+
+      // ---- Annotated-frame dump -------------------------------------
+      // Dump every frame in range with its post-navigate box set into
+      // `<runId>-frames/`. Same contract as the detect route:
+      // best-effort, per-frame try/catch so one sharp failure can't
+      // kill the rest of the run. Boxes keep their `origin` tag, so
+      // the annotator colors fresh navigator additions differently
+      // from surviving curator/OCR boxes.
+      if (runLog.enabled && runLog.framesDir) {
+        const annotateT0 = Date.now();
+        const padWidth = Math.max(3, String(hi).length);
+        const pad = (n: number): string => String(n).padStart(padWidth, "0");
+        let annotatedFrames = 0;
+        for (let idx1 = lo; idx1 <= hi; idx1++) {
+          const state = entry.perFrame[idx1];
+          if (!state) continue;
+          try {
+            const annotated = await annotateFrame(
+              state.blob,
+              state.matched.map((b) => ({
+                x: b.x,
+                y: b.y,
+                w: b.w,
+                h: b.h,
+                label: b.text,
+                origin: b.origin ?? "ocr",
+              })),
+            );
+            runLog.writeFrame(`frame-${pad(idx1)}.jpg`, annotated);
+            annotatedFrames += 1;
+          } catch (e) {
+            aerr(`navigate annotated frame dump failed for idx=${idx1}`, e);
+          }
+        }
+        alog("navigate route annotated frames written", {
+          frames_written: annotatedFrames,
+          frames_dir: runLog.framesDir,
+          elapsed_ms: Date.now() - annotateT0,
+        });
+        runLog.write({
+          kind: "annotated_frames_written",
+          frames_written: annotatedFrames,
+          frames_dir: runLog.framesDir,
+          elapsed_ms: Date.now() - annotateT0,
+        });
       }
 
       // ---- Cost summary ---------------------------------------------

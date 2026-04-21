@@ -13,6 +13,13 @@ export type OcrFrameResult = {
   raw: unknown;
 };
 
+export type OcrRawFrameResult = {
+  index: number;
+  width: number;
+  height: number;
+  raw: unknown;
+};
+
 function buildForm(
   file: File,
   query: string,
@@ -27,6 +34,32 @@ function buildForm(
   const form = new FormData();
   form.append("file", file);
   form.append("query", query);
+  if (opts.frameFrom != null) form.append("frame_from", String(opts.frameFrom));
+  if (opts.frameTo != null) form.append("frame_to", String(opts.frameTo));
+  if (opts.fps != null && opts.fps > 0) {
+    form.append("fps", String(opts.fps));
+  }
+  if (opts.dedupThreshold != null) {
+    form.append("dedup_threshold", String(opts.dedupThreshold));
+  }
+  if (opts.maxGap != null) {
+    form.append("max_gap", String(opts.maxGap));
+  }
+  return form;
+}
+
+function buildRawForm(
+  file: File,
+  opts: {
+    frameFrom?: number;
+    frameTo?: number;
+    fps?: number | null;
+    dedupThreshold?: number;
+    maxGap?: number;
+  },
+): FormData {
+  const form = new FormData();
+  form.append("file", file);
   if (opts.frameFrom != null) form.append("frame_from", String(opts.frameFrom));
   if (opts.frameTo != null) form.append("frame_to", String(opts.frameTo));
   if (opts.fps != null && opts.fps > 0) {
@@ -114,6 +147,91 @@ export async function fetchOcrDetect(
     }
     if (ev.type === "error") {
       throw new Error(`Python OCR detect error: ${String(ev.message ?? "?")}`);
+    }
+  };
+
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let nl = buf.indexOf("\n");
+      while (nl !== -1) {
+        handleLine(buf.slice(0, nl));
+        buf = buf.slice(nl + 1);
+        nl = buf.indexOf("\n");
+      }
+    }
+    buf += decoder.decode();
+    if (buf.length > 0) handleLine(buf);
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {
+      /* ignore */
+    }
+  }
+
+  frames.sort((a, b) => a.index - b.index);
+  return { videoHash, frames };
+}
+
+/**
+ * POST to the Python OCR raw stream and collect per-frame raw Textract
+ * responses (no query filtering, no matched boxes).
+ */
+export async function fetchOcrRaw(
+  file: File,
+  opts: {
+    frameFrom?: number;
+    frameTo?: number;
+    fps?: number | null;
+    dedupThreshold?: number;
+    maxGap?: number;
+  },
+): Promise<{ videoHash: string; frames: OcrRawFrameResult[] }> {
+  const base = pythonApiBaseUrl();
+  const res = await fetch(`${base}/api/ocr/raw/stream`, {
+    method: "POST",
+    body: buildRawForm(file, opts),
+  });
+  if (!res.ok || !res.body) {
+    const text = res.body ? await res.text().catch(() => "") : "";
+    throw new Error(
+      `Python OCR raw stream failed: ${res.status}${text ? ` ${text}` : ""}`,
+    );
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  let videoHash = "";
+  const frames: OcrRawFrameResult[] = [];
+
+  const handleLine = (line: string) => {
+    const trimmed = line.trim();
+    if (!trimmed) return;
+    let ev: Record<string, unknown>;
+    try {
+      ev = JSON.parse(trimmed);
+    } catch {
+      return;
+    }
+    if (ev.type === "start" && typeof ev.video_hash === "string") {
+      videoHash = ev.video_hash;
+      return;
+    }
+    if (ev.type === "frame") {
+      frames.push({
+        index: Number(ev.index),
+        width: Number(ev.width),
+        height: Number(ev.height),
+        raw: ev.raw ?? null,
+      });
+      return;
+    }
+    if (ev.type === "error") {
+      throw new Error(`Python OCR raw stream error: ${String(ev.message ?? "?")}`);
     }
   };
 

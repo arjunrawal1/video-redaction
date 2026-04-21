@@ -49,6 +49,7 @@
 import { generateText, stepCountIs, tool, type LanguageModelUsage } from "ai";
 import { z } from "zod";
 import { aerr, alog } from "./agentic-log";
+import { normalizeHexColor } from "./box-shrink";
 import { addUsage, emptyUsage, geminiCost, type AggregateUsage } from "./cost";
 import type { NavFrameState, NavHit, NavigatorEvent } from "./agentic-navigator";
 import {
@@ -556,7 +557,7 @@ async function runFocusedAgent(opts: FocusedAgentOpts): Promise<FocusedAgentResu
   });
 
   const addBoxTool = tool({
-    description: `Add a new redaction box on frame ${focusFrame} (THIS agent's focus frame). Coords are Gemini's native box_2d format: [y_min, x_min, y_max, x_max] in 0..1000 (top-left origin). STRICT coord-source priority: (1) copy from a get_ocr_text WORD/LINE block on this frame; (2) measure from a code_execution crop of this frame; (3) pure estimation ONLY as last resort. DO NOT copy the anchor frame's bbox and DO NOT invent coords from UI semantics ("formula bar should show…", "selected cell F27 would be here…"). The \`reason\` field must name the tier and the evidence (e.g. "Tier 1: OCR WORD 'or' at [y,x,y,x]=..." or "Tier 2: code_execution crop (x,y,w,h)=...").`,
+    description: `Add a new redaction box on frame ${focusFrame} (THIS agent's focus frame). Coords are Gemini's native box_2d format: [y_min, x_min, y_max, x_max] in 0..1000 (top-left origin). You MUST also label \`text_color_hex\` + \`background_color_hex\` — dominant hex colors (6-digit RGB, e.g. '#111111' / '#ffffff') of the text glyphs and the surrounding background. These feed the downstream pixel-level shrink pass that tightens boxes whose corners poke into margin. STRICT coord-source priority: (1) copy from a get_ocr_text WORD/LINE block on this frame; (2) measure from a code_execution crop of this frame; (3) pure estimation ONLY as last resort. DO NOT copy the anchor frame's bbox and DO NOT invent coords from UI semantics ("formula bar should show…", "selected cell F27 would be here…"). The \`reason\` field must name the tier and the evidence (e.g. "Tier 1: OCR WORD 'or' at [y,x,y,x]=..." or "Tier 2: code_execution crop (x,y,w,h)=..."). BEFORE calling this, CHECK that no existing hit in \`current_hits\` already covers the region you're about to redact — stacking boxes (IoU > ~0.7, or one contains >80% of the other) is never correct, it's either a duplicate (do nothing) or a tightening (drop the existing one first via remove_box in the rare case it's genuinely worth replacing). On occlusion frames where OCR only sees a short sliver (e.g. 'or'), the sliver's OCR bbox IS the right redaction — do NOT widen it into the popup body using Tier 2.`,
     inputSchema: z.object({
       frame_index: z.number().int(),
       text: z.string(),
@@ -564,13 +565,35 @@ async function runFocusedAgent(opts: FocusedAgentOpts): Promise<FocusedAgentResu
       x_min: z.number().int().min(0).max(1000),
       y_max: z.number().int().min(0).max(1000),
       x_max: z.number().int().min(0).max(1000),
+      text_color_hex: z
+        .string()
+        .describe(
+          "Dominant hex color of the TEXT GLYPHS inside the box, as 6-digit RGB (e.g. '#111111').",
+        ),
+      background_color_hex: z
+        .string()
+        .describe(
+          "Dominant hex color of the background around/between the glyphs, as 6-digit RGB (e.g. '#ffffff').",
+        ),
       reason: z.string().optional(),
     }),
-    execute: async ({ frame_index, text, y_min, x_min, y_max, x_max, reason }) => {
+    execute: async ({
+      frame_index,
+      text,
+      y_min,
+      x_min,
+      y_max,
+      x_max,
+      text_color_hex,
+      background_color_hex,
+      reason,
+    }) => {
       alog(`[${agentId}] tool add_box invoked`, {
         frame_index,
         text,
         box_2d: [y_min, x_min, y_max, x_max],
+        text_color_hex,
+        background_color_hex,
         reason,
       });
       const guard = enforceFocus(frame_index);
@@ -593,6 +616,8 @@ async function runFocusedAgent(opts: FocusedAgentOpts): Promise<FocusedAgentResu
         origin: "fix",
         hit_id: mintHitId(),
         reason: reason ?? undefined,
+        text_color_hex: normalizeHexColor(text_color_hex),
+        background_color_hex: normalizeHexColor(background_color_hex),
       };
       hit.track_id = trackIdForFix(hit);
       focus.hits.push(hit);
@@ -646,18 +671,37 @@ async function runFocusedAgent(opts: FocusedAgentOpts): Promise<FocusedAgentResu
   });
 
   const adoptOcrTool = tool({
-    description: `Promote an OCR candidate rectangle on frame ${focusFrame} (THIS agent's focus frame) into a real hit. ocr_index refers to the pre-filtered candidate list returned by get_frame on the focus frame.`,
+    description: `Promote an OCR candidate rectangle on frame ${focusFrame} (THIS agent's focus frame) into a real hit. ocr_index refers to the pre-filtered candidate list returned by get_frame on the focus frame. You MUST label \`text_color_hex\` + \`background_color_hex\` — dominant hex colors of the glyphs and the background — which feed the downstream pixel-level shrink pass.`,
     inputSchema: z.object({
       frame_index: z.number().int(),
       ocr_index: z.number().int(),
       text: z.string().optional(),
+      text_color_hex: z
+        .string()
+        .describe(
+          "Dominant hex color of the TEXT GLYPHS inside the OCR box, as 6-digit RGB (e.g. '#111111').",
+        ),
+      background_color_hex: z
+        .string()
+        .describe(
+          "Dominant hex color of the background around/between the glyphs, as 6-digit RGB (e.g. '#ffffff').",
+        ),
       reason: z.string().optional(),
     }),
-    execute: async ({ frame_index, ocr_index, text, reason }) => {
+    execute: async ({
+      frame_index,
+      ocr_index,
+      text,
+      text_color_hex,
+      background_color_hex,
+      reason,
+    }) => {
       alog(`[${agentId}] tool adopt_ocr_box invoked`, {
         frame_index,
         ocr_index,
         text,
+        text_color_hex,
+        background_color_hex,
         reason,
       });
       const guard = enforceFocus(frame_index);
@@ -676,6 +720,8 @@ async function runFocusedAgent(opts: FocusedAgentOpts): Promise<FocusedAgentResu
         origin: "fix",
         hit_id: mintHitId(),
         reason: reason ?? undefined,
+        text_color_hex: normalizeHexColor(text_color_hex),
+        background_color_hex: normalizeHexColor(background_color_hex),
       };
       hit.track_id = trackIdForFix(hit);
       focus.hits.push(hit);
@@ -786,9 +832,25 @@ async function runFocusedAgent(opts: FocusedAgentOpts): Promise<FocusedAgentResu
     "  - spatially-shifted instances (scrolling moved it but it's still on-screen)",
     "Cross-frame reassembly attack: if frame N shows `test wor` and frame N+1 shows `est word`, the viewer reconstructs the full sensitive text. Redact BOTH.",
     "",
+    "ONE BOX PER REDACTION — DO NOT STACK BOXES",
+    "Before calling add_box, CHECK the `current_hits` list in your focus frame summary. Each existing hit is a redaction that's already in place. Rules:",
+    "  - If an existing hit already covers the visible fragment you want to redact (hit's bbox contains the fragment's bbox, OR their IoU is clearly high), DO NOTHING. Stacking a second box on top of it adds no safety, just visual clutter and downstream dedup work. This is the single most common mistake — most of the time the answer is 'existing coverage, skip add_box' and finish(still_visible=true).",
+    "  - If an existing hit covers MOST of the visible fragment but a strip is still exposed (e.g. OCR caught the left half of 'test word' but the right half extends past that box), add a SINGLE box covering ONLY the uncovered strip. Do not re-cover the already-covered part.",
+    "  - If the tracked text is genuinely SPLIT on this frame (e.g. a popup sits in the middle of one instance, leaving characters visible on BOTH the left AND the right of the popup), that IS two physically separate regions → two boxes, one per region, non-overlapping. This is rare.",
+    "  - If an existing hit is wider than the actually visible fragment (e.g. hit covers 'test word' bbox but the popup occludes most of it so only 'or' is really showing), the existing hit still safely redacts the visible pixels — do not shrink it, do not add a narrower box on top. Skip.",
+    "  - Duplicate / near-identical adds (two boxes with IoU > ~0.7 or one contains >80% of the other) are ALWAYS a bug, never 'extra safety'.",
+    "",
+    "OCCLUSION SLIVERS — critical rule about widening past OCR",
+    "When a popup/modal/dropdown occludes part of the tracked text, only the UNOCCLUDED sliver is visible. Rules:",
+    "  - If raw OCR on this frame has a SHORT block (≤ 3 chars) that is a substring of the tracked content, and no wider block at the same y-row matches a longer substring of it, that short block IS the sliver. Redact EXACTLY its bbox, nothing wider.",
+    "  - Do NOT use Tier 2 (code_execution) to widen the sliver leftward/rightward into the popup body. The reason the wider text isn't in OCR is that it's occluded — it's not visible — and redacting it just covers popup interior text (font names, menu items) that the user explicitly opened.",
+    "  - The ANCHOR'S WIDTH IS A TRAP in occlusion cases. The anchor frame (without the popup) shows the full word; the current frame shows a sliver of it. You are redacting VISIBLE pixels on THIS frame, not reconstructing the anchor.",
+    "  - EXCEPTION — MOUSE CURSOR obstruction: this rule does NOT apply to the mouse pointer / text cursor / hover-caret. A mouse cursor is a tiny, transient obstruction that will move next frame and re-expose the text underneath. If the ONLY thing covering part of the tracked text is a mouse cursor (arrow pointer, I-beam, hand cursor), keep the FULL anchor-width redaction over the whole text region — do NOT shrink to a sliver around the cursor, and do NOT split into left/right boxes around the cursor. It is FINE for the mouse cursor itself to get redacted along with the text; that's a few harmless pixels of cursor, not a privacy leak. Only shrink/split when the obstruction is a real UI surface (popup, modal, dropdown, tooltip, menu, autocomplete, another window).",
+    "",
     "YOUR PROCESS",
     "1. Read the inlined focus-frame OCR dump + image in the first user message. That is already everything you need for most frames.",
-    `2. Only if the inlined dump does not contain a block you suspect exists on the focus frame — e.g. you want to try a substring filter not covered in the pre-filtered "relevant raw blocks" above — call get_ocr_text({frame_indices:[${focusFrame}], filters:[<substring>, <substring>, ...]}) with ALL substrings in one call.`,
+    "2. Check `current_hits`: is the visible fragment already covered by an existing hit? If yes → do nothing, finish(still_visible=true). This is the MOST common correct outcome in a cascade — phase-1 almost always caught the sliver already.",
+    `3. Only if the inlined dump does not contain a block you suspect exists on the focus frame — e.g. you want to try a substring filter not covered in the pre-filtered "relevant raw blocks" above — call get_ocr_text({frame_indices:[${focusFrame}], filters:[<substring>, <substring>, ...]}) with ALL substrings in one call.`,
     "",
     "COORDINATE SOURCE — STRICT PRIORITY ORDER (do NOT skip tiers)",
     "Tier 1 — OCR coords (REQUIRED FIRST ATTEMPT).",
@@ -805,8 +867,7 @@ async function runFocusedAgent(opts: FocusedAgentOpts): Promise<FocusedAgentResu
     "  - NEVER widen an OCR block to match the anchor's width. If only 'or' is visible, redact ONLY the 'or' block's bbox.",
     "  - If you catch yourself about to add a box whose `reason` is 'same position as anchor' or 'should be in <UI element>', STOP. Either find a supporting OCR block or a code-execution measurement, or do not add the box.",
     "",
-    "3. If partial content is visible but NOT already covered by an existing hit, add_box using coords from the highest-priority tier that succeeded. Mention the tier and source in `reason` (e.g. 'Tier 1: OCR WORD block `or` at ocr_index=N' / 'Tier 2: code_execution crop measured (x,y,w,h)=…').",
-    "4. If the focus frame already has a hit that fully covers the visible partial, no action needed.",
+    "4. If partial content is visible AND NOT already covered by an existing hit, add_box using coords from the highest-priority tier that succeeded. Mention the tier and source in `reason` (e.g. 'Tier 1: OCR WORD block `or` at ocr_index=N' / 'Tier 2: code_execution crop measured (x,y,w,h)=…'). Only ONE box per uncovered region. ALWAYS label `text_color_hex` + `background_color_hex` — dominant hex RGB colors of the text glyphs and surrounding background (e.g. '#111111' / '#ffffff'); these feed a deterministic pixel-level shrink pass that trims box sides whose corners poke into margin.",
     "5. Call finish(summary, still_visible) to end. If neither OCR nor code-execution found the fragment on this frame, that's strong evidence `still_visible=false` — don't invent coords just to keep the cascade alive.",
     "",
     "STOP SEMANTICS — `still_visible`",

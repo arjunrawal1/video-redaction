@@ -10,7 +10,7 @@
   },
   "dependencies": {
     "@ai-sdk/google": "^3.0.64",
-    "@openrouter/ai-sdk-provider": "^2.8.0",
+    "@ai-sdk/google-vertex": "^4.0.112",
     "ai": "^6.0.168",
     "next": "16.2.4",
     "react": "19.2.4",

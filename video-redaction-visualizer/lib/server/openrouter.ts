@@ -1,19 +1,21 @@
-// OpenRouter-backed vision helpers used by the Gemini pipeline.
+// Vertex-AI-backed vision + agentic helpers.
 //
-// Two public calls:
+// Two public vision calls (legacy "gemini" engine):
 //   - detectFrame(jpeg, query, known)  → phase-1 per-frame detection + labeling
 //   - compareFrames(ref, target, ...)  → phase-2/3 partial localization
 //
-// Both use Vercel AI SDK's generateObject with a Zod schema so the model's
-// output is structurally validated. Bboxes come back in 0..1000 normalized
-// coords and we convert to pixel-space Box via bboxToPixels.
+// Both use the Vercel AI SDK's `generateObject` with a Zod schema so the
+// model's output is structurally validated. Bboxes come back in 0..1000
+// normalized coords and we convert to pixel-space Box via bboxToPixels.
+//
+// The agentic pipeline (curator, linker, cascade, navigator) is defined
+// further down and runs the same Gemini models through the same Vertex
+// provider instance so we share auth, quota, and billing with the rest
+// of the stack.
 
-import {
-  type GoogleGenerativeAIProviderOptions,
-  createGoogleGenerativeAI,
-  google,
-} from "@ai-sdk/google";
-import { createOpenRouter } from "@openrouter/ai-sdk-provider";
+import path from "node:path";
+import { type GoogleGenerativeAIProviderOptions } from "@ai-sdk/google";
+import { createVertex, vertex } from "@ai-sdk/google-vertex";
 import { generateObject } from "ai";
 import { z } from "zod";
 
@@ -36,6 +38,28 @@ export type ServerBox = {
    * Undefined until the linker has run (e.g. still streaming phase-1).
    */
   track_id?: string;
+  // Prompt-mode only: stable per-instance identity and branch/category
+  // metadata emitted by the predicate pipeline.
+  instance_id?: string;
+  branch?: string;
+  category?: string | null;
+  /**
+   * Gemini-labeled dominant foreground (text glyph) color of the
+   * redacted region, as a 6-digit hex RGB string (e.g. "#111111"). Set
+   * by any path that emits a new box with color context — the agentic
+   * curator, the cascade/navigator tool calls, and the prompt-mode
+   * curator tools. The post-processing box-shrink pass uses this
+   * together with `background_color_hex` to iteratively tighten box
+   * sides whose two corners both fall on background pixels (see
+   * `lib/server/box-shrink.ts`).
+   *
+   * Missing on code paths that don't have visual context (prompt-mode
+   * deterministic fallback, text fast-path, linker fallback). Boxes
+   * without both colors are passed through the shrink pass unchanged.
+   */
+  text_color_hex?: string;
+  /** Dominant background (surrounding pixels) color hex. See `text_color_hex`. */
+  background_color_hex?: string;
 };
 
 export type KnownLabel = {
@@ -72,59 +96,216 @@ const CompareItemSchema = z.object({
   text: z.string(),
 });
 
-// -- Client singleton -----------------------------------------------------
-
-let _provider: ReturnType<typeof createOpenRouter> | null = null;
-
-export function getOpenRouter(): ReturnType<typeof createOpenRouter> {
-  if (_provider) return _provider;
-  const apiKey = process.env.OPENROUTER_API_KEY;
-  if (!apiKey) {
-    throw new Error(
-      "OPENROUTER_API_KEY missing. Add it to video-redaction-visualizer/.env.local.",
-    );
-  }
-  _provider = createOpenRouter({ apiKey });
-  return _provider;
-}
-
-function getProvider(): ReturnType<typeof createOpenRouter> {
-  return getOpenRouter();
-}
-
-function modelSlug(): string {
-  return process.env.OPENROUTER_MODEL || "google/gemini-2.5-flash";
-}
-
-// -- Google Gemini (agentic pipeline) -------------------------------------
+// -- Google Gemini via Vertex AI ------------------------------------------
 //
-// The agentic pipeline (curator + cascade + navigator) runs directly on
-// Google's Gemini API, not through OpenRouter. This is so we can access
-// Gemini-3-specific features that OpenRouter strips or doesn't expose:
-//   - `thinking_level` (vs. generic reasoning_effort)
-//   - `media_resolution_high` (explicit token budget per image — we need
-//     the full 1120-token-per-image budget for dense OCR work)
-//   - Code execution as a built-in tool — the model can write + run
-//     Python to zoom, crop, and annotate images when it needs to ground
-//     a small detail precisely.
+// Every Gemini call — both the legacy per-frame detect/compare pipeline
+// and the agentic pipeline (curator + linker + cascade + navigator) —
+// goes through a single Vertex provider instance authenticated with a
+// service-account key. Vertex gives us Gemini-3-specific features the
+// AI Studio / OpenRouter edges don't expose:
+//   - `thinkingLevel` (vs. generic reasoning_effort)
+//   - `MEDIA_RESOLUTION_HIGH` (explicit 1120-tokens-per-image budget,
+//     required for dense OCR work)
+//   - `code_execution` built-in tool — the model writes + runs Python
+//     to crop, zoom, and annotate images when it needs to ground a
+//     small detail precisely.
 //   - Automatic Thought Signature handling across tool turns (strictly
 //     required for function-calling reasoning continuity).
+//
+// The AI SDK's Vertex provider wraps the same Gemini language-model
+// interface as the AI Studio provider, so call sites don't need to
+// care which transport is in use. Provider options are still nested
+// under `google` in `providerOptions` (the Vertex provider shares the
+// underlying Google Gemini language model implementation).
 
-let _google: ReturnType<typeof createGoogleGenerativeAI> | null = null;
+const VERTEX_PROJECT = process.env.GOOGLE_CLOUD_PROJECT
+  || process.env.GOOGLE_VERTEX_PROJECT
+  || "yarn-391421";
+// `global` is the only Vertex location where `gemini-3-flash-preview` is
+// served (per https://cloud.google.com/vertex-ai/generative-ai/docs/models/gemini/3-flash),
+// and `gemini-2.5-flash` / `gemini-2.5-pro` are also available on the
+// global endpoint — so routing everything through `global` keeps both
+// the vision and agentic pipelines on a single endpoint that gives
+// higher availability than any single regional deployment. Override
+// with GOOGLE_CLOUD_LOCATION if you specifically need data-residency
+// pinning (but note regional endpoints don't serve Gemini 3 yet).
+const VERTEX_LOCATION = process.env.GOOGLE_CLOUD_LOCATION
+  || process.env.GOOGLE_VERTEX_LOCATION
+  || "global";
 
-export function getGoogleProvider(): ReturnType<typeof createGoogleGenerativeAI> {
-  if (_google) return _google;
-  const apiKey =
-    process.env.GOOGLE_GENERATIVE_AI_API_KEY ||
-    process.env.GEMINI_API_KEY ||
-    process.env.GOOGLE_API_KEY;
-  if (!apiKey) {
-    throw new Error(
-      "GOOGLE_GENERATIVE_AI_API_KEY missing. Add it to video-redaction-visualizer/.env.local.",
-    );
+/**
+ * Absolute path to the Vertex service-account key JSON. Override via
+ * `GOOGLE_APPLICATION_CREDENTIALS`; otherwise resolve to
+ * `<repo-root>/vertexCreds/key.json` — which for our Next.js process
+ * (cwd = `video-redaction-visualizer/`) is one directory up.
+ */
+function resolveVertexKeyFile(): string {
+  const env = process.env.GOOGLE_APPLICATION_CREDENTIALS;
+  if (env && env.length > 0) return env;
+  return path.resolve(process.cwd(), "..", "vertexCreds", "key.json");
+}
+
+let _google: ReturnType<typeof createVertex> | null = null;
+
+/**
+ * Workaround for vercel/ai#13911 (open as of @ai-sdk/google@3.0.64).
+ *
+ * When Gemini 3+ is combined with BOTH function tools and a
+ * provider-defined tool (our case: `code_execution` alongside
+ * `finish`/`add_box`/`remove_box`/...), `@ai-sdk/google`'s
+ * `google-prepare-tools.ts` hard-codes
+ * `tool_config.includeServerSideToolInvocations: true` on the outgoing
+ * request.
+ *
+ * That flag is valid on the Google AI Studio edge
+ * (`generativelanguage.googleapis.com`) but Vertex AI's endpoint
+ * (`aiplatform.googleapis.com`) rejects it with
+ * `400 Invalid JSON payload received. Unknown name "includeServerSideToolInvocations" at 'tool_config': Cannot find field.`
+ *
+ * Every cascade + navigator agent call was failing → 0 steps, 0 tokens,
+ * $0.00. We intercept outgoing Vertex requests here, strip the field
+ * from `tool_config` before forwarding, and let the rest of the payload
+ * through unchanged. DELETE THIS WRAPPER once the SDK ships a fix.
+ */
+function stripVertexIncompatibleToolConfig(bodyText: string): string {
+  try {
+    const body = JSON.parse(bodyText);
+    const cfg = (body as Record<string, unknown>)?.tool_config ??
+      (body as Record<string, unknown>)?.toolConfig;
+    if (cfg && typeof cfg === "object") {
+      const c = cfg as Record<string, unknown>;
+      if ("includeServerSideToolInvocations" in c) {
+        delete c.includeServerSideToolInvocations;
+      }
+      if ("include_server_side_tool_invocations" in c) {
+        delete c.include_server_side_tool_invocations;
+      }
+    }
+    return JSON.stringify(body);
+  } catch {
+    return bodyText;
   }
-  _google = createGoogleGenerativeAI({ apiKey });
+}
+
+/**
+ * Workaround for vercel/ai#10344 / #11466 (still leaking on stable
+ * `@ai-sdk/google@3.0.64` + `@ai-sdk/google-vertex@4.0.112` as of Apr 2026).
+ *
+ * Gemini 3 ("thinking") models attach an opaque `thoughtSignature` to every
+ * `functionCall` content part they emit. On each replay turn, Vertex AI
+ * rejects the request with:
+ *
+ *   400: Unable to submit request because function call `<name>`
+ *        in the N. content block is missing a `thought_signature`.
+ *
+ * unless every replayed `functionCall` part carries its original signature.
+ * The SDK fixed the common-case namespace-desync path in 3.0.27, but the
+ * built-in `code_execution` provider-defined tool still slips through on
+ * multi-step agent loops: the `code_execution` `functionCall` round-trips
+ * without its signature and Vertex rejects turn N+1.
+ *
+ * This patch walks outgoing `contents[].parts[]` and, for any `model`-role
+ * `functionCall` part missing a `thoughtSignature`, clones one from a
+ * sibling part in the same turn (any neighbor that still has one — the
+ * signature is per-reasoning-chunk, not per-call, and Vertex only validates
+ * presence). Also handles the snake_case `thought_signature` spelling that
+ * some SDK paths emit. Preserves every other field untouched.
+ *
+ * DELETE THIS WRAPPER once `@ai-sdk/google` ships the fix on the stable
+ * (non-beta) channel.
+ */
+type PartLike = Record<string, unknown> & {
+  functionCall?: unknown;
+  function_call?: unknown;
+  thoughtSignature?: string;
+  thought_signature?: string;
+};
+
+function readThoughtSignature(part: PartLike): string | undefined {
+  const a = part.thoughtSignature;
+  if (typeof a === "string" && a.length > 0) return a;
+  const b = part.thought_signature;
+  if (typeof b === "string" && b.length > 0) return b;
+  return undefined;
+}
+
+function hasFunctionCall(part: PartLike): boolean {
+  return (
+    (part.functionCall !== undefined && part.functionCall !== null) ||
+    (part.function_call !== undefined && part.function_call !== null)
+  );
+}
+
+function backfillThoughtSignatures(bodyText: string): string {
+  try {
+    const body = JSON.parse(bodyText) as Record<string, unknown>;
+    const contents = body.contents;
+    if (!Array.isArray(contents)) return bodyText;
+    let mutated = false;
+    for (const turn of contents) {
+      if (!turn || typeof turn !== "object") continue;
+      const t = turn as Record<string, unknown>;
+      if (t.role !== "model") continue;
+      const parts = t.parts;
+      if (!Array.isArray(parts)) continue;
+      // First pass: collect any signature present in this turn.
+      let donor: string | undefined;
+      for (const p of parts) {
+        if (!p || typeof p !== "object") continue;
+        const sig = readThoughtSignature(p as PartLike);
+        if (sig) {
+          donor = sig;
+          break;
+        }
+      }
+      if (!donor) continue;
+      for (const p of parts) {
+        if (!p || typeof p !== "object") continue;
+        const part = p as PartLike;
+        if (!hasFunctionCall(part)) continue;
+        if (readThoughtSignature(part)) continue;
+        part.thoughtSignature = donor;
+        mutated = true;
+      }
+    }
+    return mutated ? JSON.stringify(body) : bodyText;
+  } catch {
+    return bodyText;
+  }
+}
+
+const vertexPatchedFetch: typeof fetch = async (input, init) => {
+  if (init && typeof init.body === "string" && init.body.length > 0) {
+    let patched = stripVertexIncompatibleToolConfig(init.body);
+    patched = backfillThoughtSignatures(patched);
+    if (patched !== init.body) {
+      init = { ...init, body: patched };
+    }
+  }
+  return fetch(input as RequestInfo, init);
+};
+
+export function getGoogleProvider(): ReturnType<typeof createVertex> {
+  if (_google) return _google;
+  const keyFile = resolveVertexKeyFile();
+  _google = createVertex({
+    project: VERTEX_PROJECT,
+    location: VERTEX_LOCATION,
+    googleAuthOptions: { keyFile },
+    fetch: vertexPatchedFetch,
+  });
   return _google;
+}
+
+/**
+ * Model id used by the legacy per-frame detect / compare vision calls
+ * (`detectFrame` / `compareFrames`). Defaults to Gemini 2.5 Flash — the
+ * cheapest Vertex-hosted Gemini that still produces trustworthy 0..1000
+ * bounding-box output. Override via `GEMINI_VISION_MODEL` (e.g. to
+ * `gemini-2.5-pro` for tricky low-contrast text).
+ */
+function visionModelId(): string {
+  return process.env.GEMINI_VISION_MODEL || "gemini-2.5-flash";
 }
 
 /**
@@ -217,22 +398,18 @@ export function agenticProviderOptions() {
  * benefit from code execution (cascade + navigator). The tool name MUST
  * be `code_execution` — Gemini rejects other keys.
  */
-export function agenticBuiltinTools(): Record<string, ReturnType<typeof google.tools.codeExecution>> {
+export function agenticBuiltinTools(): Record<string, ReturnType<typeof vertex.tools.codeExecution>> {
   if (!agenticCodeExecutionEnabled()) return {};
-  return { code_execution: google.tools.codeExecution({}) };
+  return { code_execution: vertex.tools.codeExecution({}) };
 }
 
 /**
- * Backward-compatible alias used by logging. Returns the model id instead
- * of an OpenRouter slug now that we're on Google direct.
+ * Backward-compatible alias used by logging. Returns the Vertex Gemini
+ * model id; the `*Slug` name is a relic from when these calls went
+ * through OpenRouter.
  */
 export function agenticModelSlug(): string {
   return agenticModelId();
-}
-
-export function openrouterConcurrency(): number {
-  const raw = Number(process.env.OPENROUTER_CONCURRENCY || "4");
-  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 4;
 }
 
 export function agenticCuratorConcurrency(): number {
@@ -494,8 +671,7 @@ export async function detectFrame(
   frameW: number,
   frameH: number,
 ): Promise<{ boxes: ServerBox[]; raw: unknown }> {
-  const provider = getProvider();
-  const model = provider(modelSlug());
+  const model = getGoogleProvider()(visionModelId());
 
   const knownSummary =
     known.length === 0
@@ -566,8 +742,7 @@ export async function compareFrames(
   targetFrameW: number,
   targetFrameH: number,
 ): Promise<{ box: ServerBox | null; raw: unknown }> {
-  const provider = getProvider();
-  const model = provider(modelSlug());
+  const model = getGoogleProvider()(visionModelId());
 
   const refBbox = pixelBoxToNormalizedBbox(refHit, refFrameW, refFrameH);
   const userText = [

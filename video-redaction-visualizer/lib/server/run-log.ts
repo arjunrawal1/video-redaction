@@ -21,6 +21,7 @@ import {
   createWriteStream,
   existsSync,
   mkdirSync,
+  writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
 
@@ -32,9 +33,23 @@ export type RunLog = {
   /** Absolute path to the .jsonl file — surface to the client so the
    *  user can open it. Will be "" on a no-op logger. */
   path: string;
+  /**
+   * Absolute path to the sibling directory this run writes annotated
+   * frames into (`<runId>-frames/`). Lazily created the first time a
+   * frame is written. Empty string on a no-op logger or when frame
+   * logging is disabled via ``AGENTIC_LOG_FRAMES=off``.
+   */
+  framesDir: string;
   /** True iff write() does anything. */
   enabled: boolean;
   write: (event: RunLogEvent) => void;
+  /**
+   * Write a raw binary artifact (typically an annotated JPEG) into the
+   * frames directory. ``name`` is the filename; callers should pass
+   * the full basename including extension (e.g. ``"frame-042.jpg"``).
+   * Fire-and-forget: errors are logged to console but never thrown.
+   */
+  writeFrame: (name: string, bytes: Uint8Array) => void;
   close: () => Promise<void>;
 };
 
@@ -71,8 +86,10 @@ export function openRunLog(
   const noop: RunLog = {
     id: "",
     path: "",
+    framesDir: "",
     enabled: false,
     write: () => {},
+    writeFrame: () => {},
     close: async () => {},
   };
 
@@ -123,6 +140,37 @@ export function openRunLog(
 
   write({ kind: "run_start", run_kind: kind, ...meta });
 
+  // Frame-dump support. Disabled at the env level (``AGENTIC_LOG_FRAMES=off``)
+  // or when we can't create the directory. The directory is created
+  // lazily on the first ``writeFrame`` call so a run that never produces
+  // annotated frames leaves zero empty directories behind.
+  const framesEnabled = process.env.AGENTIC_LOG_FRAMES !== "off";
+  const framesDir = framesEnabled ? join(dir, `${id}-frames`) : "";
+  let framesDirReady = false;
+  const writeFrame = (name: string, bytes: Uint8Array): void => {
+    if (!framesEnabled || !framesDir) return;
+    if (!framesDirReady) {
+      try {
+        if (!existsSync(framesDir)) mkdirSync(framesDir, { recursive: true });
+        framesDirReady = true;
+      } catch (e) {
+        console.warn(
+          "[run-log] could not create frames dir, disabling frame dump:",
+          (e as Error).message,
+        );
+        return;
+      }
+    }
+    try {
+      writeFileSync(join(framesDir, name), bytes);
+    } catch (e) {
+      console.warn(
+        `[run-log] failed to write frame ${name}:`,
+        (e as Error).message,
+      );
+    }
+  };
+
   const close = (): Promise<void> =>
     new Promise<void>((resolve) => {
       if (closed) return resolve();
@@ -130,7 +178,7 @@ export function openRunLog(
       stream.end(() => resolve());
     });
 
-  return { id, path, enabled: true, write, close };
+  return { id, path, framesDir, enabled: true, write, writeFrame, close };
 }
 
 /**
