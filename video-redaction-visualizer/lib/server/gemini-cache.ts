@@ -1,11 +1,15 @@
-// Module-level LRU cache of per-frame Gemini state. Mirrors the Python
-// app/ocr_cache.py shape so the pass-driver can treat both engines the same.
+// Module-level LRU cache of per-frame engine state. Mirrors the Python
+// app/ocr_cache.py shape. Used by both the `gemini` and `teamwork`
+// engines (the agentic navigator in particular reads phase-1 state from
+// here to build its initial context).
 //
 // Only lives in the Next.js process memory — fine for `next dev` (single
 // node). Prod deployments that horizontally scale would swap this for
 // Redis / a shared KV, but that's out of scope.
 
 import type { ServerBox } from "./openrouter";
+
+export type Engine = "gemini" | "teamwork";
 
 export type FrameState = {
   width: number;
@@ -15,9 +19,19 @@ export type FrameState = {
   matched: ServerBox[];
   raw: unknown | null;
   blob: Uint8Array;
+  // Teamwork-only: cached Textract raw response for this frame. Included
+  // in the curator's "copy OCR debug" payload on the client.
+  ocrRaw?: unknown;
+  // Teamwork-only: OCR's phase-1 boxes per frame. The navigator uses
+  // these as `ocr_candidates` the model can adopt via `adopt_ocr_box`.
+  ocrMatched?: ServerBox[];
+  // Unused in the agentic pipeline but kept for schema compatibility
+  // with prior runs cached in memory.
+  flagged?: boolean;
 };
 
 export type CacheEntry = {
+  engine: Engine;
   videoHash: string;
   queryNorm: string;
   fps: number | null;
@@ -31,6 +45,7 @@ export type CacheEntry = {
 type Key = string;
 
 function makeKey(p: {
+  engine: Engine;
   videoHash: string;
   queryNorm: string;
   fps: number | null;
@@ -39,6 +54,7 @@ function makeKey(p: {
   frameTo: number;
 }): Key {
   return [
+    p.engine,
     p.videoHash,
     p.queryNorm,
     p.fps ?? "null",
@@ -52,6 +68,7 @@ const _MAX_ENTRIES = 8;
 const _cache = new Map<Key, CacheEntry>();
 
 export function createEntry(p: {
+  engine: Engine;
   videoHash: string;
   queryNorm: string;
   fps: number | null;
@@ -60,6 +77,7 @@ export function createEntry(p: {
   frameTo: number;
 }): CacheEntry {
   const entry: CacheEntry = {
+    engine: p.engine,
     videoHash: p.videoHash,
     queryNorm: p.queryNorm,
     fps: p.fps,
@@ -78,6 +96,7 @@ export function createEntry(p: {
 }
 
 export function getEntry(p: {
+  engine: Engine;
   videoHash: string;
   queryNorm: string;
   fps: number | null;

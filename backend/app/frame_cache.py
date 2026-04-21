@@ -21,6 +21,16 @@ class FrameSet:
     frames: tuple[bytes, ...]
     raw_count: int
     kept_count: int
+    # 0-based indices into the original ffmpeg-emitted sequence for each
+    # kept frame. `kept_source_indices[k] / source_fps` is the source-video
+    # timestamp of the k-th kept frame. Used by the video exporter to paint
+    # detection boxes onto the right time windows.
+    kept_source_indices: tuple[int, ...]
+    # Effective frames-per-second of the extraction. When the caller passed
+    # an explicit fps it's that value; when they let ffmpeg emit every
+    # decoded frame we probe the source with ffprobe. `None` means probing
+    # failed and timestamp-based features are unavailable.
+    source_fps: float | None
 
 
 _CacheKey = tuple[str, float | None, int, int]
@@ -63,7 +73,13 @@ def get_or_extract(
             _cache.move_to_end(key)
             return hit, video_hash
 
-    blobs, raw_count, kept_count = extract_deduplicated_frames(
+    (
+        blobs,
+        raw_count,
+        kept_count,
+        kept_source_indices,
+        source_fps,
+    ) = extract_deduplicated_frames(
         body,
         suffix=suffix,
         fps=fps,
@@ -74,6 +90,8 @@ def get_or_extract(
         frames=tuple(blobs),
         raw_count=raw_count,
         kept_count=kept_count,
+        kept_source_indices=kept_source_indices,
+        source_fps=source_fps,
     )
 
     with _lock:

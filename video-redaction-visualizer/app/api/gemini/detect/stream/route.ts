@@ -81,6 +81,7 @@ export async function POST(req: Request): Promise<Response> {
   const hi = frameTo;
 
   const entry = createEntry({
+    engine: "gemini",
     videoHash: framesRes.videoHash,
     queryNorm: qNorm,
     fps: fps ?? null,

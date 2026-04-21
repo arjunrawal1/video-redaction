@@ -1,8 +1,11 @@
 import asyncio
 import base64
+import io
 import json
 import logging
 import os
+import shutil
+import tempfile
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -10,12 +13,14 @@ from typing import AsyncIterator
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
+from PIL import Image
+from starlette.background import BackgroundTask
 
 from app.frame_cache import get_or_extract
 from app.frame_service import FrameExtractionError
 from app.logging_config import configure as configure_logging
-from app import ocr_backtrack, ocr_cache
+from app import ocr_backtrack, ocr_cache, video_export
 from app.ocr_service import (
     detect_frame,
     ensure_reader_loaded,
@@ -99,12 +104,13 @@ async def deduplicated_frames(
         ),
     ),
     dedup_threshold: int = Query(
-        4,
+        2,
         ge=0,
         le=256,
         description=(
-            "Perceptual hash Hamming threshold on a 256-bit phash "
-            "(lower = stricter; only near-exact duplicates are removed)."
+            "Hamming threshold applied to both a 256-bit phash and a "
+            "240-bit dhash (lower = stricter; frame is kept when either "
+            "hash distance exceeds the threshold)."
         ),
     ),
 ) -> dict:
@@ -140,6 +146,18 @@ async def deduplicated_frames(
         for b in frame_set.frames
     ]
 
+    # All dedup frames share dimensions (ffmpeg's scale filter caps width
+    # uniformly, with `-2` preserving aspect). Inspect the first kept
+    # frame so the client has a reference coordinate space for exports.
+    frame_width = 0
+    frame_height = 0
+    if frame_set.frames:
+        try:
+            with Image.open(io.BytesIO(frame_set.frames[0])) as im:
+                frame_width, frame_height = im.size
+        except Exception:  # pragma: no cover
+            log.exception("failed to read dedup frame dimensions")
+
     return {
         "filename": file.filename,
         "video_hash": video_hash,
@@ -147,6 +165,8 @@ async def deduplicated_frames(
         "dedup_threshold": dedup_threshold,
         "raw_frame_count": frame_set.raw_count,
         "deduplicated_count": frame_set.kept_count,
+        "frame_width": frame_width,
+        "frame_height": frame_height,
         "frames": frames_out,
     }
 
@@ -164,7 +184,7 @@ async def detect_stream(
     frame_from: int = Form(1, ge=1),
     frame_to: int | None = Form(None),
     fps: float | None = Form(None),
-    dedup_threshold: int = Form(4),
+    dedup_threshold: int = Form(2),
 ) -> StreamingResponse:
     """Stream OCR detections across a frame range as NDJSON.
 
@@ -655,7 +675,7 @@ async def backtrack_stream(
     frame_from: int = Form(1, ge=1),
     frame_to: int | None = Form(None),
     fps: float | None = Form(None),
-    dedup_threshold: int = Form(4),
+    dedup_threshold: int = Form(2),
 ) -> StreamingResponse:
     """Stream backward-pass hits as NDJSON.
 
@@ -683,7 +703,7 @@ async def forward_stream(
     frame_from: int = Form(1, ge=1),
     frame_to: int | None = Form(None),
     fps: float | None = Form(None),
-    dedup_threshold: int = Form(4),
+    dedup_threshold: int = Form(2),
 ) -> StreamingResponse:
     """Stream forward-pass hits as NDJSON.
 
@@ -704,3 +724,231 @@ async def forward_stream(
         origin="forward",
         driver=ocr_backtrack.run_forward,
     )
+
+
+def _parse_export_boxes(raw: object) -> list[video_export.ExportBox]:
+    """Flatten the client's `boxes_by_frame` mapping into a list.
+
+    Accepts `{ "<frame_idx_1>": [ { x, y, w, h }, ... ], ... }`. Unknown
+    keys are ignored; invalid boxes are dropped rather than failing the
+    whole request (the UI stats may legitimately carry zero-area entries
+    after a no-op re-run).
+    """
+    if not isinstance(raw, dict):
+        return []
+    out: list[video_export.ExportBox] = []
+    for k, v in raw.items():
+        try:
+            frame_1 = int(k)
+        except (TypeError, ValueError):
+            continue
+        if frame_1 < 1 or not isinstance(v, list):
+            continue
+        for entry in v:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                x = float(entry["x"])
+                y = float(entry["y"])
+                w = float(entry["w"])
+                h = float(entry["h"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if w <= 0 or h <= 0:
+                continue
+            out.append(
+                video_export.ExportBox(
+                    frame=frame_1, x=x, y=y, w=w, h=h,
+                )
+            )
+    return out
+
+
+@app.post("/api/video/export")
+async def export_video(
+    file: UploadFile = File(...),
+    payload: str = Form(...),
+) -> FileResponse:
+    """Render a redacted MP4 with detection boxes painted as filled
+    rectangles on the source video.
+
+    Request (multipart):
+      - `file`: source video
+      - `payload`: JSON string with
+          {
+            "fps": null | number,          // same value used at detect time
+            "dedup_threshold": 2,
+            "frame_width": number,         // reference frame dims
+            "frame_height": number,
+            "boxes_by_frame": {
+              "<kept_frame_idx_1>": [ { "x","y","w","h" }, ... ],
+              ...
+            },
+            "style": { "color": "black", "padding_px": 4 }
+          }
+
+    Returns an MP4. The time range each kept frame represents is
+    reconstructed from the (video_hash, fps, dedup_threshold) frame
+    cache; boxes are scaled from reference frame dims to source video
+    resolution before rendering.
+    """
+    _validate_video(file)
+    t_req = time.perf_counter()
+    body = await file.read()
+    if not body:
+        raise HTTPException(status_code=400, detail="Empty file.")
+    if len(body) > _MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="File too large.")
+
+    try:
+        parsed = json.loads(payload)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=400, detail=f"Invalid payload JSON: {e}",
+        ) from e
+    if not isinstance(parsed, dict):
+        raise HTTPException(status_code=400, detail="Payload must be an object.")
+
+    fps = parsed.get("fps")
+    if fps is not None:
+        try:
+            fps = float(fps)
+        except (TypeError, ValueError) as e:
+            raise HTTPException(status_code=400, detail="Invalid fps.") from e
+        if fps <= 0:
+            fps = None
+
+    dedup_threshold_raw = parsed.get("dedup_threshold", 2)
+    try:
+        dedup_threshold = int(dedup_threshold_raw)
+    except (TypeError, ValueError) as e:
+        raise HTTPException(
+            status_code=400, detail="Invalid dedup_threshold.",
+        ) from e
+
+    try:
+        ref_width = int(parsed.get("frame_width", 0))
+        ref_height = int(parsed.get("frame_height", 0))
+    except (TypeError, ValueError) as e:
+        raise HTTPException(
+            status_code=400, detail="Invalid reference dimensions.",
+        ) from e
+    if ref_width <= 0 or ref_height <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="frame_width and frame_height must be positive.",
+        )
+
+    style_raw = parsed.get("style") or {}
+    style = video_export.ExportStyle(
+        color=str(style_raw.get("color") or "black"),
+        padding_px=int(style_raw.get("padding_px") or 4),
+    )
+
+    boxes = _parse_export_boxes(parsed.get("boxes_by_frame"))
+
+    log.info(
+        "export: recv file=%r bytes=%d boxes=%d ref=%dx%d fps=%s dedup=%d",
+        file.filename,
+        len(body),
+        len(boxes),
+        ref_width,
+        ref_height,
+        fps,
+        dedup_threshold,
+    )
+
+    suffix = _guess_suffix(file.filename)
+    try:
+        frame_set, video_hash = get_or_extract(
+            body,
+            suffix=suffix,
+            fps=fps,
+            dedup_threshold=dedup_threshold,
+        )
+    except FrameExtractionError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+
+    if frame_set.source_fps is None or frame_set.source_fps <= 0:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Could not determine source video frame rate; export "
+                "requires a probable fps (re-run detection with an "
+                "explicit fps or install ffprobe)."
+            ),
+        )
+
+    # Write the source video to a stable temp file so ffmpeg/ffprobe can
+    # work against a path. We keep it alive until after ffmpeg returns.
+    tmp_dir = Path(tempfile.mkdtemp(prefix="export_"))
+    try:
+        source_path = tmp_dir / f"input{suffix}"
+        source_path.write_bytes(body)
+
+        try:
+            info = video_export.probe_video_info(source_path)
+        except video_export.VideoExportError as e:
+            raise HTTPException(status_code=422, detail=str(e)) from e
+
+        filter_graph = video_export.build_drawbox_filter(
+            boxes=boxes,
+            kept_source_indices=frame_set.kept_source_indices,
+            source_fps=frame_set.source_fps,
+            duration=info.duration,
+            ref_width=ref_width,
+            ref_height=ref_height,
+            src_width=info.width,
+            src_height=info.height,
+            style=style,
+        )
+
+        log.info(
+            "export: video_hash=%s src=%dx%d duration=%.2fs "
+            "source_fps=%.3f filter_chars=%d",
+            video_hash[:12],
+            info.width,
+            info.height,
+            info.duration,
+            frame_set.source_fps,
+            len(filter_graph),
+        )
+
+        out_path = tmp_dir / "redacted.mp4"
+        try:
+            await asyncio.to_thread(
+                video_export.render_redacted_video,
+                source_path=source_path,
+                out_path=out_path,
+                filter_graph=filter_graph,
+            )
+        except video_export.VideoExportError as e:
+            raise HTTPException(status_code=500, detail=str(e)) from e
+
+        req_ms = (time.perf_counter() - t_req) * 1000
+        log.info("export: done in %.0fms -> %s", req_ms, out_path)
+
+        # FileResponse does not clean up on its own; schedule the temp dir
+        # for removal after the response finishes streaming.
+        download_name = _export_filename(file.filename)
+        return FileResponse(
+            path=out_path,
+            media_type="video/mp4",
+            filename=download_name,
+            background=BackgroundTask(_rmtree, tmp_dir),
+        )
+    except BaseException:
+        _rmtree(tmp_dir)
+        raise
+
+
+def _export_filename(source: str | None) -> str:
+    base = Path(source or "video").stem or "video"
+    return f"{base}.redacted.mp4"
+
+
+def _rmtree(path: Path) -> None:
+    try:
+        shutil.rmtree(path, ignore_errors=True)
+    except Exception:  # pragma: no cover
+        pass

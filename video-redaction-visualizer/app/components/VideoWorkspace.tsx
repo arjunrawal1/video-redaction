@@ -2,13 +2,16 @@
 
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import {
+  exportRedactedVideo,
   fetchDeduplicatedFrames,
   getFramesApiBase,
   streamBacktrack,
   streamDetect,
   streamForward,
+  streamNavigate,
   type DeduplicatedFramesResponse,
   type DetectionFrame,
+  type ExportBoxRect,
 } from "@/lib/frames-api";
 import { assignLabels, type FrameLabelMap } from "@/lib/labeling";
 
@@ -23,6 +26,9 @@ type DetectionEntry = {
   // Color for forward-pass boxes. Baked when the phase-3 event arrives.
   forwardColor?: string;
   raw?: unknown;
+  // Teamwork phase-1 flag: Gemini still saw query text on the
+  // OCR-filled frame. Rendered as a small warning badge on the thumbnail.
+  flagged?: boolean;
 };
 type DetectionMap = Record<number, DetectionEntry>;
 
@@ -46,6 +52,23 @@ function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
   return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function formatToolCall(name: string, input: unknown): string {
+  if (!input || typeof input !== "object") return `${name}(?)`;
+  const i = input as Record<string, unknown>;
+  if (name === "get_frame") return `get_frame(#${i.frame_index})`;
+  if (name === "add_box") {
+    return `add_box(#${i.frame_index}, "${String(i.text ?? "").slice(0, 24)}")`;
+  }
+  if (name === "remove_box") {
+    return `remove_box(#${i.frame_index}, ${String(i.hit_id ?? "?")})`;
+  }
+  if (name === "adopt_ocr_box") {
+    return `adopt_ocr_box(#${i.frame_index}, ocr:${i.ocr_index})`;
+  }
+  if (name === "finish") return `finish()`;
+  return `${name}(${JSON.stringify(input).slice(0, 80)})`;
 }
 
 function DetectionOverlay({
@@ -77,7 +100,12 @@ function DetectionOverlay({
             ? entry.backtrackColor ?? BACKTRACK_COLOR
             : b.origin === "forward"
               ? entry.forwardColor ?? BACKTRACK_COLOR
-              : entry.color;
+              : b.origin === "fix"
+                ? // Teamwork phase-4 fix boxes reuse the backward color so
+                // they visually stand apart from first-pass hits without
+                // needing another picker. See onDetect verify step.
+                entry.backtrackColor ?? BACKTRACK_COLOR
+                : entry.color;
         const boxStyle = {
           left: `${(b.x / width) * 100}%`,
           top: `${(b.y / height) * 100}%`,
@@ -265,9 +293,11 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
   const [query, setQuery] = useState("");
   const [frameFrom, setFrameFrom] = useState<number>(1);
   const [frameTo, setFrameTo] = useState<number>(1);
-  // "ocr" calls the Python backend (Textract). "gemini" calls the Next.js
-  // route handlers (OpenRouter + Vercel AI SDK).
-  const [engine, setEngine] = useState<"ocr" | "gemini">("ocr");
+  // "ocr"      → Python backend (Textract).
+  // "gemini"   → Next.js routes (OpenRouter + Vercel AI SDK).
+  // "teamwork" → Agentic: parallel per-frame curator + tool-calling
+  //              navigator. Gemini 3 Pro is the ultimate decision maker.
+  const [engine, setEngine] = useState<"ocr" | "gemini" | "teamwork">("ocr");
   const [firstPassColor, setFirstPassColor] = useState<string>(
     DEFAULT_FIRST_PASS_COLOR,
   );
@@ -310,9 +340,34 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
   } | null>(null);
   const [forwardTouched, setForwardTouched] = useState<number[]>([]);
 
+  // Agentic navigator state (teamwork engine only). Replaces the old
+  // backtrack / forward / verify chain with a single tool-using Gemini
+  // session that decides what to fix and moves between frames freely.
+  const [navigating, setNavigating] = useState(false);
+  const [navStats, setNavStats] = useState<{
+    steps: number;
+    added: number;
+    removed: number;
+    finishSummary: string | null;
+  } | null>(null);
+  const [navTouched, setNavTouched] = useState<number[]>([]);
+  // Rolling log of tool calls + model text for live UI feedback.
+  const [navEvents, setNavEvents] = useState<
+    Array<{ id: number; step: number; label: string }>
+  >([]);
+
+  // Full-video export. The blob URL stays alive as the `href` of the
+  // download link; we revoke it on replace/unmount to avoid leaking.
+  const [exporting, setExporting] = useState(false);
+  const [exportError, setExportError] = useState<string | null>(null);
+  const [exportUrl, setExportUrl] = useState<string | null>(null);
+  const [exportFilename, setExportFilename] = useState<string | null>(null);
+
   const detectAbortRef = useRef<AbortController | null>(null);
   const backtrackAbortRef = useRef<AbortController | null>(null);
   const forwardAbortRef = useRef<AbortController | null>(null);
+  const navigateAbortRef = useRef<AbortController | null>(null);
+  const exportAbortRef = useRef<AbortController | null>(null);
 
   const totalFrames = framesResult?.deduplicated_count ?? 0;
 
@@ -355,9 +410,22 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
     setForwarding(false);
     setForwardStats(null);
     setForwardTouched([]);
+    setNavigating(false);
+    setNavStats(null);
+    setNavTouched([]);
+    setNavEvents([]);
+    setExporting(false);
+    setExportError(null);
+    setExportUrl((prev) => {
+      if (prev) URL.revokeObjectURL(prev);
+      return null;
+    });
+    setExportFilename(null);
+    exportAbortRef.current?.abort();
     detectAbortRef.current?.abort();
     backtrackAbortRef.current?.abort();
     forwardAbortRef.current?.abort();
+    navigateAbortRef.current?.abort();
   }, [file]);
 
   // When frames arrive (or count changes), default the range to the full span.
@@ -386,6 +454,7 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
     let primaryBoxes = 0;
     let backtrackBoxes = 0;
     let forwardBoxes = 0;
+    let fixBoxes = 0;
     let covered = 0;
     for (const entry of Object.values(detections)) {
       covered += 1;
@@ -393,15 +462,17 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
       for (const b of entry.detection.boxes) {
         if (b.origin === "backtrack") backtrackBoxes += 1;
         else if (b.origin === "forward") forwardBoxes += 1;
+        else if (b.origin === "fix") fixBoxes += 1;
         else primaryBoxes += 1;
       }
     }
     return {
       matched,
-      boxes: primaryBoxes + backtrackBoxes + forwardBoxes,
+      boxes: primaryBoxes + backtrackBoxes + forwardBoxes + fixBoxes,
       primaryBoxes,
       backtrackBoxes,
       forwardBoxes,
+      fixBoxes,
       covered,
     };
   }, [detections]);
@@ -418,6 +489,7 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
       detectAbortRef.current?.abort();
       backtrackAbortRef.current?.abort();
       forwardAbortRef.current?.abort();
+      exportAbortRef.current?.abort();
       const ac = new AbortController();
       detectAbortRef.current = ac;
       setDetecting(true);
@@ -428,6 +500,14 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
       setBacktrackTouched([]);
       setForwardStats(null);
       setForwardTouched([]);
+      // A new detection run invalidates any previously exported video.
+      setExporting(false);
+      setExportError(null);
+      setExportUrl((prev) => {
+        if (prev) URL.revokeObjectURL(prev);
+        return null;
+      });
+      setExportFilename(null);
 
       // Snapshot the pickers + engine at run start so later changes don't
       // retroactively recolor this run's boxes (consistent with the existing
@@ -469,6 +549,7 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
                   },
                   color: currentColor,
                   raw: event.raw,
+                  flagged: Boolean(event.flagged),
                 },
               }));
               setRunProgress((p) =>
@@ -492,7 +573,146 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
 
       if (!phase1Ok || ac.signal.aborted) return;
 
-      // --- Phase 2: backtrack ----------------------------------------------
+      // --- Teamwork branch: agentic navigator replaces backtrack/forward ---
+      if (currentEngine === "teamwork") {
+        const nac = new AbortController();
+        navigateAbortRef.current = nac;
+        setNavigating(true);
+        let nextEventId = 0;
+        try {
+          await streamNavigate(
+            file,
+            q,
+            { frameFrom: from, frameTo: to, engine: currentEngine },
+            (event) => {
+              if (event.type === "frame_update") {
+                setDetections((prev) => {
+                  const existing = prev[event.index];
+                  if (event.action === "add") {
+                    const incoming = {
+                      ...event.box,
+                      origin: event.box.origin ?? ("fix" as const),
+                    };
+                    if (existing) {
+                      return {
+                        ...prev,
+                        [event.index]: {
+                          ...existing,
+                          backtrackColor: currentBackwardColor,
+                          detection: {
+                            ...existing.detection,
+                            boxes: existing.detection.boxes.some(
+                              (b) =>
+                                b.x === incoming.x &&
+                                b.y === incoming.y &&
+                                b.w === incoming.w &&
+                                b.h === incoming.h &&
+                                b.origin === incoming.origin,
+                            )
+                              ? existing.detection.boxes
+                              : [...existing.detection.boxes, incoming],
+                          },
+                        },
+                      };
+                    }
+                    return {
+                      ...prev,
+                      [event.index]: {
+                        detection: {
+                          width: 0,
+                          height: 0,
+                          boxes: [incoming],
+                        },
+                        color: currentColor,
+                        backtrackColor: currentBackwardColor,
+                      },
+                    };
+                  }
+                  if (!existing) return prev;
+                  return {
+                    ...prev,
+                    [event.index]: {
+                      ...existing,
+                      detection: {
+                        ...existing.detection,
+                        boxes: existing.detection.boxes.filter(
+                          (b) =>
+                            !(
+                              b.x === event.box.x &&
+                              b.y === event.box.y &&
+                              b.w === event.box.w &&
+                              b.h === event.box.h
+                            ),
+                        ),
+                      },
+                    },
+                  };
+                });
+                setNavTouched((prev) =>
+                  prev.includes(event.index) ? prev : [...prev, event.index],
+                );
+              } else if (event.type === "tool_call") {
+                const label = formatToolCall(event.name, event.input);
+                const id = nextEventId++;
+                setNavEvents((prev) =>
+                  [...prev, { id, step: event.step, label }].slice(-30),
+                );
+              } else if (event.type === "tool_result") {
+                const id = nextEventId++;
+                setNavEvents((prev) =>
+                  [
+                    ...prev,
+                    {
+                      id,
+                      step: event.step,
+                      label: `↳ ${event.summary}`,
+                    },
+                  ].slice(-30),
+                );
+              } else if (event.type === "model_text") {
+                const id = nextEventId++;
+                setNavEvents((prev) =>
+                  [
+                    ...prev,
+                    {
+                      id,
+                      step: event.step,
+                      label: `💭 ${event.text.slice(0, 140)}${event.text.length > 140 ? "…" : ""}`,
+                    },
+                  ].slice(-30),
+                );
+              } else if (event.type === "finish") {
+                setNavStats((prev) => ({
+                  steps: event.total_steps,
+                  added: prev?.added ?? 0,
+                  removed: prev?.removed ?? 0,
+                  finishSummary: event.summary,
+                }));
+              } else if (event.type === "done") {
+                setNavStats((prev) => ({
+                  steps: event.total_steps,
+                  added: event.added_boxes,
+                  removed: event.removed_boxes,
+                  finishSummary: prev?.finishSummary ?? null,
+                }));
+              } else if (event.type === "error") {
+                setDetectError(event.message);
+              }
+            },
+            nac.signal,
+          );
+        } catch (err) {
+          if (nac.signal.aborted) return;
+          setDetectError(
+            err instanceof Error ? err.message : "Navigator failed.",
+          );
+        } finally {
+          if (!nac.signal.aborted) setNavigating(false);
+        }
+        return;
+      }
+
+      // --- Phase 2: backtrack (ocr + gemini engines) ------------------------
       const bac = new AbortController();
       backtrackAbortRef.current = bac;
       setBacktracking(true);
@@ -574,6 +794,7 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
       const fac = new AbortController();
       forwardAbortRef.current = fac;
       setForwarding(true);
+      let phase3Ok = false;
       try {
         await streamForward(
           file,
@@ -633,6 +854,7 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
           },
           fac.signal,
         );
+        phase3Ok = true;
       } catch (err) {
         if (fac.signal.aborted) return;
         setDetectError(
@@ -641,6 +863,8 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
       } finally {
         if (!fac.signal.aborted) setForwarding(false);
       }
+
+      if (!phase3Ok || fac.signal.aborted) return;
     },
     [
       file,
@@ -659,27 +883,118 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
     detectAbortRef.current?.abort();
     backtrackAbortRef.current?.abort();
     forwardAbortRef.current?.abort();
+    navigateAbortRef.current?.abort();
     setDetecting(false);
     setBacktracking(false);
     setForwarding(false);
+    setNavigating(false);
   }, []);
 
   const onClearDetection = useCallback(() => {
     detectAbortRef.current?.abort();
     backtrackAbortRef.current?.abort();
     forwardAbortRef.current?.abort();
+    navigateAbortRef.current?.abort();
+    exportAbortRef.current?.abort();
     setDetections({});
     setLastQuery("");
     setDetectError(null);
     setDetecting(false);
     setBacktracking(false);
     setForwarding(false);
+    setNavigating(false);
     setBacktrackStats(null);
     setBacktrackTouched([]);
     setForwardStats(null);
     setForwardTouched([]);
+    setNavStats(null);
+    setNavTouched([]);
+    setNavEvents([]);
     setRunProgress(null);
+    setExporting(false);
+    setExportError(null);
+    setExportUrl((prev) => {
+      if (prev) URL.revokeObjectURL(prev);
+      return null;
+    });
+    setExportFilename(null);
   }, []);
+
+  const onExport = useCallback(async () => {
+    if (!framesResult) return;
+    const refWidth = framesResult.frame_width;
+    const refHeight = framesResult.frame_height;
+    if (!refWidth || !refHeight) {
+      setExportError(
+        "Missing reference frame dimensions from the API response.",
+      );
+      return;
+    }
+
+    // Flatten the current detections map into the { frame: boxes } shape
+    // the export endpoint expects. Zero-box frames are skipped so the
+    // server doesn't emit no-op drawbox instances.
+    const boxesByFrame: Record<number, ExportBoxRect[]> = {};
+    for (const [k, entry] of Object.entries(detections)) {
+      const frameNumber = Number(k);
+      if (!Number.isFinite(frameNumber) || entry.detection.boxes.length === 0) {
+        continue;
+      }
+      boxesByFrame[frameNumber] = entry.detection.boxes.map((b) => ({
+        x: b.x,
+        y: b.y,
+        w: b.w,
+        h: b.h,
+      }));
+    }
+
+    if (Object.keys(boxesByFrame).length === 0) {
+      setExportError("No detections to export yet. Run Detect first.");
+      return;
+    }
+
+    exportAbortRef.current?.abort();
+    const ac = new AbortController();
+    exportAbortRef.current = ac;
+
+    setExportError(null);
+    setExporting(true);
+    setExportUrl((prev) => {
+      if (prev) URL.revokeObjectURL(prev);
+      return null;
+    });
+    setExportFilename(null);
+
+    try {
+      const blob = await exportRedactedVideo(file, {
+        fps: framesResult.fps,
+        dedupThreshold: framesResult.dedup_threshold,
+        frameWidth: refWidth,
+        frameHeight: refHeight,
+        boxesByFrame,
+        signal: ac.signal,
+      });
+      if (ac.signal.aborted) return;
+      const url = URL.createObjectURL(blob);
+      const base = (file.name || "video").replace(/\.[^.]+$/, "") || "video";
+      setExportUrl(url);
+      setExportFilename(`${base}.redacted.mp4`);
+    } catch (err) {
+      if (ac.signal.aborted) return;
+      setExportError(err instanceof Error ? err.message : "Export failed.");
+    } finally {
+      if (!ac.signal.aborted) setExporting(false);
+    }
+  }, [detections, file, framesResult]);
+
+  useEffect(() => {
+    // Revoke any pending blob URL when this panel unmounts (e.g. on clip
+    // replacement). The reset effects above handle the replace case; this
+    // catches teardown.
+    return () => {
+      if (exportUrl) URL.revokeObjectURL(exportUrl);
+    };
+  }, [exportUrl]);
 
   const selectFullRange = useCallback(() => {
     if (totalFrames > 0) {
@@ -772,7 +1087,7 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           placeholder="Text to find and redact (e.g. an email, a name)"
-          disabled={detecting || backtracking || forwarding || loading || !framesResult}
+          disabled={detecting || backtracking || forwarding || navigating || loading || !framesResult}
           className="min-w-56 flex-1 rounded-md border border-border bg-background px-3 py-1.5 text-sm text-foreground outline-none placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-sky-500 disabled:opacity-60"
         />
 
@@ -792,7 +1107,7 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
               const v = Number(e.target.value);
               setFrameFrom(Number.isFinite(v) ? v : 1);
             }}
-            disabled={detecting || backtracking || forwarding || loading || !framesResult}
+            disabled={detecting || backtracking || forwarding || navigating || loading || !framesResult}
             className="w-14 bg-transparent text-foreground outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
           />
           <span aria-hidden="true" className="text-muted-foreground">
@@ -812,7 +1127,7 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
               const v = Number(e.target.value);
               setFrameTo(Number.isFinite(v) ? v : 1);
             }}
-            disabled={detecting || backtracking || forwarding || loading || !framesResult}
+            disabled={detecting || backtracking || forwarding || navigating || loading || !framesResult}
             className="w-14 bg-transparent text-foreground outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
           />
           <span className="ml-1 text-[10px] text-muted-foreground">
@@ -821,7 +1136,7 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
           <button
             type="button"
             onClick={selectFullRange}
-            disabled={detecting || backtracking || forwarding || loading || !totalFrames}
+            disabled={detecting || backtracking || forwarding || navigating || loading || !totalFrames}
             className="ml-1 rounded px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-40"
             title="Set range to all frames"
           >
@@ -844,7 +1159,7 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
               type="color"
               value={firstPassColor}
               onChange={(e) => setFirstPassColor(e.target.value)}
-              disabled={detecting || backtracking || forwarding}
+              disabled={detecting || backtracking || forwarding || navigating}
               className="h-5 w-6 cursor-pointer appearance-none rounded border border-border bg-transparent p-0 disabled:opacity-50"
             />
           </label>
@@ -859,7 +1174,7 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
               type="color"
               value={backwardPassColor}
               onChange={(e) => setBackwardPassColor(e.target.value)}
-              disabled={detecting || backtracking || forwarding}
+              disabled={detecting || backtracking || forwarding || navigating}
               className="h-5 w-6 cursor-pointer appearance-none rounded border border-border bg-transparent p-0 disabled:opacity-50"
             />
           </label>
@@ -874,7 +1189,7 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
               type="color"
               value={forwardPassColor}
               onChange={(e) => setForwardPassColor(e.target.value)}
-              disabled={detecting || backtracking || forwarding}
+              disabled={detecting || backtracking || forwarding || navigating}
               className="h-5 w-6 cursor-pointer appearance-none rounded border border-border bg-transparent p-0 disabled:opacity-50"
             />
           </label>
@@ -885,20 +1200,26 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
           aria-label="Detection engine"
           className="inline-flex overflow-hidden rounded-md border border-border text-xs"
         >
-          {(["ocr", "gemini"] as const).map((k) => {
+          {(["ocr", "gemini", "teamwork"] as const).map((k) => {
             const active = engine === k;
+            const label =
+              k === "ocr" ? "OCR" : k === "gemini" ? "Gemini" : "Agentic";
+            const title =
+              k === "ocr"
+                ? "Textract OCR via Python backend"
+                : k === "gemini"
+                  ? "OpenRouter (Gemini 2.5) via Vercel AI SDK"
+                  : "Agentic: Gemini 3 Flash (direct) — per-frame curator + bi-directional cascade navigator with code-execution tool for image zoom";
             return (
               <button
                 key={k}
                 type="button"
                 onClick={() => setEngine(k)}
                 aria-pressed={active}
-                disabled={detecting || backtracking || forwarding}
-                title={
-                  k === "ocr"
-                    ? "Textract OCR via Python backend"
-                    : "OpenRouter (Gemini 2.5 Flash) via Vercel AI SDK"
+                disabled={
+                  detecting || backtracking || forwarding || navigating
                 }
+                title={title}
                 className={[
                   "px-2 py-1 font-medium transition-colors disabled:opacity-50",
                   active
@@ -906,13 +1227,13 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
                     : "bg-background text-muted-foreground hover:bg-muted hover:text-foreground",
                 ].join(" ")}
               >
-                {k === "ocr" ? "OCR" : "Gemini"}
+                {label}
               </button>
             );
           })}
         </div>
 
-        {detecting || backtracking || forwarding ? (
+        {detecting || backtracking || forwarding || navigating ? (
           <button
             type="button"
             onClick={onCancel}
@@ -930,7 +1251,7 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
           </button>
         )}
 
-        {stats.covered > 0 && !detecting && !backtracking && !forwarding && (
+        {stats.covered > 0 && !detecting && !backtracking && !forwarding && !navigating && (
           <button
             type="button"
             onClick={onClearDetection}
@@ -984,6 +1305,57 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
         </p>
       )}
 
+      {stats.boxes > 0 && (
+        <div
+          className="flex flex-wrap items-center gap-2 rounded-lg border border-border bg-background/60 p-2"
+          aria-label="Export redacted video"
+        >
+          <button
+            type="button"
+            onClick={onExport}
+            disabled={
+              exporting ||
+              detecting ||
+              backtracking ||
+              forwarding ||
+              navigating
+            }
+            className="rounded-md bg-foreground px-3 py-1.5 text-sm font-medium text-background transition-opacity hover:opacity-90 disabled:opacity-50"
+          >
+            {exporting
+              ? "Rendering…"
+              : exportUrl
+                ? "Re-export"
+                : "Export redacted video"}
+          </button>
+
+          {exportUrl && exportFilename && !exporting && (
+            <a
+              href={exportUrl}
+              download={exportFilename}
+              className="rounded-md border border-border bg-background px-3 py-1.5 text-sm font-medium text-foreground transition-colors hover:bg-muted"
+            >
+              Download {exportFilename}
+            </a>
+          )}
+
+          <span className="text-[11px] text-muted-foreground">
+            Paints {stats.boxes} box{stats.boxes === 1 ? "" : "es"} across{" "}
+            {stats.matched} frame{stats.matched === 1 ? "" : "s"} onto the
+            source video at native resolution. Audio is copied.
+          </span>
+
+          {exportError && (
+            <span
+              role="status"
+              className="w-full rounded-md border border-destructive/40 bg-destructive/10 px-2 py-1 text-xs text-destructive"
+            >
+              {exportError}
+            </span>
+          )}
+        </div>
+      )}
+
       {detecting && runProgress && (
         <p className="text-xs text-muted-foreground" aria-live="polite">
           Streaming OCR · frames {runProgress.from}–{runProgress.to} ·{" "}
@@ -1003,7 +1375,40 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
         </p>
       )}
 
-      {!detecting && !backtracking && !forwarding && backtrackStats && (
+      {navigating && !detecting && !backtracking && !forwarding && (
+        <div
+          className="flex flex-col gap-1 rounded-lg border border-border bg-background/60 p-2"
+          aria-live="polite"
+        >
+          <p className="text-xs text-muted-foreground">
+            Navigator working…{" "}
+            {navStats?.steps != null && (
+              <span className="font-mono text-foreground">
+                {navStats.steps} steps
+              </span>
+            )}{" "}
+            <span style={{ color: backwardPassColor }}>
+              +{navStats?.added ?? 0}
+            </span>
+            {" / "}
+            <span className="text-muted-foreground">
+              −{navStats?.removed ?? 0}
+            </span>
+          </p>
+          {navEvents.length > 0 && (
+            <ul className="max-h-40 overflow-y-auto rounded border border-border/60 bg-background px-2 py-1 font-mono text-[10px] text-muted-foreground">
+              {navEvents.slice(-12).map((e) => (
+                <li key={e.id} className="truncate">
+                  <span className="text-foreground">[{e.step}]</span>{" "}
+                  {e.label}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+
+      {!detecting && !backtracking && !forwarding && !navigating && backtrackStats && (
         <p className="text-[11px] text-muted-foreground">
           <span style={{ color: backwardPassColor }}>Backtrack</span> added{" "}
           {backtrackStats.addedBoxes} box
@@ -1033,7 +1438,7 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
         </p>
       )}
 
-      {!detecting && !backtracking && !forwarding && forwardStats && (
+      {!detecting && !backtracking && !forwarding && !navigating && forwardStats && (
         <p className="text-[11px] text-muted-foreground">
           <span style={{ color: forwardPassColor }}>Forward</span> added{" "}
           {forwardStats.addedBoxes} box
@@ -1058,6 +1463,40 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
                   </span>
                 ))}
             </>
+          )}
+          .
+        </p>
+      )}
+
+      {!detecting && !backtracking && !forwarding && !navigating && navStats && (
+        <p className="text-[11px] text-muted-foreground">
+          <span style={{ color: backwardPassColor }}>Agent</span> ran{" "}
+          <span className="font-mono text-foreground">{navStats.steps}</span>{" "}
+          step{navStats.steps === 1 ? "" : "s"} ·{" "}
+          <span style={{ color: backwardPassColor }}>+{navStats.added}</span>
+          {" / "}
+          <span>−{navStats.removed}</span>
+          {navTouched.length > 0 && (
+            <>
+              {" · touched: "}
+              {navTouched
+                .slice()
+                .sort((a, b) => a - b)
+                .map((n, i, arr) => (
+                  <span key={`nav-${n}`}>
+                    <span
+                      className="font-mono text-foreground"
+                      style={{ color: backwardPassColor }}
+                    >
+                      #{n}
+                    </span>
+                    {i < arr.length - 1 ? ", " : ""}
+                  </span>
+                ))}
+            </>
+          )}
+          {navStats.finishSummary && (
+            <span className="ml-2 italic">“{navStats.finishSummary}”</span>
           )}
           .
         </p>
@@ -1120,6 +1559,14 @@ function DeduplicatedFramesPanel({ file }: { file: File }) {
                   <span className="pointer-events-none absolute bottom-1.5 left-1.5 rounded bg-black/60 px-1.5 py-0.5 text-[10px] font-medium text-white">
                     #{frameNumber}
                   </span>
+                  {entry?.flagged && (
+                    <span
+                      className="pointer-events-none absolute left-1.5 top-1.5 rounded bg-amber-500 px-1 py-0.5 text-[10px] font-semibold text-white shadow-sm"
+                      title="Gemini still saw the query text on the OCR-redacted frame; may be an OCR miss"
+                    >
+                      !
+                    </span>
+                  )}
                   {entry?.detection.boxes.length ? (() => {
                     const primary = entry.detection.boxes.filter(
                       (b) => b.origin == null,

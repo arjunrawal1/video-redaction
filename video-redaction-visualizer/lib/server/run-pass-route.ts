@@ -91,6 +91,7 @@ export async function runPassRoute(
 
     // Cache hit or transparent phase-1 population.
     let entry = getEntry({
+      engine: "gemini",
       videoHash: framesRes.videoHash,
       queryNorm: qNorm,
       fps: fps ?? null,
@@ -186,6 +187,7 @@ async function populatePhase1(opts: {
   hi: number;
 }): Promise<CacheEntry> {
   const entry = createEntry({
+    engine: "gemini",
     videoHash: opts.framesRes.videoHash,
     queryNorm: opts.qNorm,
     fps: opts.fps,

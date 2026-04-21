@@ -36,7 +36,11 @@ export async function readFormInputs(
   const frameFrom = Math.max(1, Math.floor(asNum(frameFromRaw) ?? 1));
   const frameTo = asNum(frameToRaw) == null ? null : Math.floor(asNum(frameToRaw)!);
   const fps = asNum(fpsRaw) == null ? null : (asNum(fpsRaw) as number);
-  const dedupThreshold = Math.floor(asNum(dedupRaw) ?? 4);
+  // Keep in sync with `_DEFAULT_DEDUP_THRESHOLD` in
+  // backend/app/frame_service.py — this default is part of the cache key
+  // for both the Python frame cache and the Gemini/teamwork caches, so
+  // drift here would silently invalidate everything.
+  const dedupThreshold = Math.floor(asNum(dedupRaw) ?? 2);
 
   return { file, query, frameFrom, frameTo, fps, dedupThreshold };
 }

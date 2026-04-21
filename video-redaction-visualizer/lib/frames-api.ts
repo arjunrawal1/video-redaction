@@ -19,6 +19,11 @@ export type DeduplicatedFramesResponse = {
   dedup_threshold: number;
   raw_frame_count: number;
   deduplicated_count: number;
+  // Reference pixel dimensions shared by every kept frame. Detection
+  // boxes live in this space; the exporter uses it to scale boxes up to
+  // the source video's native resolution.
+  frame_width: number;
+  frame_height: number;
   frames: DeduplicatedFrame[];
 };
 
@@ -29,8 +34,12 @@ export type DetectionBox = {
   h: number;
   text: string;
   score: number;
-  // Set by the second/third passes; first-pass detect hits have this unset.
-  origin?: "backtrack" | "forward";
+  // Set by later passes; first-pass detect hits leave this unset.
+  //  - "backtrack" / "forward" come from the chain-extension passes.
+  //  - "fix" comes from teamwork's phase-4 final Gemini recheck: boxes
+  //    added because Gemini still saw the query after every prior
+  //    detection was painted over.
+  origin?: "backtrack" | "forward" | "fix";
   // Excel-style cross-frame identity label. Populated by engines that
   // produce labels server-side (Gemini). OCR leaves this undefined and the
   // client falls back to the deterministic assignLabels pass.
@@ -63,6 +72,9 @@ export type DetectFrameEvent = {
   // Full Textract DetectDocumentText response for this frame, included
   // verbatim so the UI can surface it via a "Copy OCR debug" button.
   raw?: unknown;
+  // Teamwork-only: set when Gemini still saw query text on the
+  // OCR-filled frame. UI renders a warning badge.
+  flagged?: boolean;
 };
 
 export type DetectDoneEvent = {
@@ -87,9 +99,10 @@ export type StreamDetectOptions = {
   frameTo?: number;
   fps?: number;
   dedupThreshold?: number;
-  // "ocr"   → Python backend /api/ocr/*    (default)
-  // "gemini"→ Next.js route   /api/gemini/* (same-origin, Vercel AI SDK)
-  engine?: "ocr" | "gemini";
+  // "ocr"     → Python backend /api/ocr/*      (default)
+  // "gemini"  → Next.js route   /api/gemini/*   (same-origin, Vercel AI SDK)
+  // "teamwork"→ Next.js route   /api/teamwork/* (OCR + Gemini cooperation)
+  engine?: "ocr" | "gemini" | "teamwork";
 };
 
 export type BacktrackStartEvent = {
@@ -257,13 +270,21 @@ function buildDetectForm(
   return form;
 }
 
-type PassName = "detect/stream" | "backtrack" | "forward";
+type PassName = "detect/stream" | "backtrack" | "forward" | "navigate";
 
-function passUrl(pass: PassName, engine: "ocr" | "gemini" | undefined): string {
+function passUrl(
+  pass: PassName,
+  engine: "ocr" | "gemini" | "teamwork" | undefined,
+): string {
   if (engine === "gemini") {
-    // Same-origin Next.js route handler.
     return `/api/gemini/${pass}`;
   }
+  if (engine === "teamwork") {
+    return `/api/teamwork/${pass}`;
+  }
+  // OCR doesn't have a navigate phase; callers should only request it
+  // for the teamwork engine. Fall back to the OCR base if somehow reached
+  // so the 404 is obvious and not a silent wrong-URL.
   return `${getFramesApiBase()}/api/ocr/${pass}`;
 }
 
@@ -313,4 +334,153 @@ export async function streamForward(
     onEvent,
     signal,
   );
+}
+
+// --- Agentic ("teamwork") navigate pass ----------------------------------
+// Streams the tool-calling Gemini agent that revises phase-1 curator
+// output by freely moving between frames.
+
+export type NavigateStartEvent = {
+  type: "start";
+  video_hash: string;
+  query: string;
+  frame_from: number;
+  frame_to: number;
+  total_frames: number;
+};
+
+export type NavigateToolCallEvent = {
+  type: "tool_call";
+  step: number;
+  name: string;
+  input: unknown;
+};
+
+export type NavigateToolResultEvent = {
+  type: "tool_result";
+  step: number;
+  name: string;
+  summary: string;
+};
+
+export type NavigateModelTextEvent = {
+  type: "model_text";
+  step: number;
+  text: string;
+};
+
+export type NavigateFrameUpdateEvent = {
+  type: "frame_update";
+  index: number;
+  action: "add" | "remove";
+  box: DetectionBox & { hit_id: string };
+};
+
+export type NavigateFinishEvent = {
+  type: "finish";
+  summary: string;
+  total_steps: number;
+};
+
+export type NavigateDoneEvent = {
+  type: "done";
+  added_boxes: number;
+  removed_boxes: number;
+  total_steps: number;
+};
+
+export type NavigateErrorEvent = {
+  type: "error";
+  message: string;
+};
+
+export type NavigateEvent =
+  | NavigateStartEvent
+  | NavigateToolCallEvent
+  | NavigateToolResultEvent
+  | NavigateModelTextEvent
+  | NavigateFrameUpdateEvent
+  | NavigateFinishEvent
+  | NavigateDoneEvent
+  | NavigateErrorEvent;
+
+export async function streamNavigate(
+  file: File,
+  query: string,
+  opts: StreamDetectOptions,
+  onEvent: (event: NavigateEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const form = buildDetectForm(file, query, opts);
+  return streamNdjson<NavigateEvent>(
+    passUrl("navigate", opts.engine ?? "teamwork"),
+    form,
+    onEvent,
+    signal,
+  );
+}
+
+// --- Full-video export ---------------------------------------------------
+// Renders an MP4 with detection boxes painted onto the source video. The
+// server reconstructs each kept frame's time window from the same frame
+// cache that detection used, so exporting the same (file, fps, dedup)
+// combination is cheap.
+
+export type ExportBoxRect = {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+};
+
+export type ExportStyle = {
+  color?: string;
+  padding_px?: number;
+};
+
+export type ExportRedactedVideoOptions = {
+  fps?: number | null;
+  dedupThreshold?: number;
+  frameWidth: number;
+  frameHeight: number;
+  boxesByFrame: Record<number, ExportBoxRect[]>;
+  style?: ExportStyle;
+  signal?: AbortSignal;
+};
+
+export async function exportRedactedVideo(
+  file: File,
+  opts: ExportRedactedVideoOptions,
+): Promise<Blob> {
+  const base = getFramesApiBase();
+  const payload = {
+    fps: opts.fps ?? null,
+    // Keep in sync with `_DEFAULT_DEDUP_THRESHOLD` in
+    // backend/app/frame_service.py. In practice the caller forwards the
+    // value from `framesResult.dedup_threshold`, but we keep a sane
+    // fallback so the cache key still hits the server default.
+    dedup_threshold: opts.dedupThreshold ?? 2,
+    frame_width: opts.frameWidth,
+    frame_height: opts.frameHeight,
+    style: {
+      color: opts.style?.color ?? "black",
+      padding_px: opts.style?.padding_px ?? 4,
+    },
+    boxes_by_frame: opts.boxesByFrame,
+  };
+  const form = new FormData();
+  form.append("file", file);
+  form.append("payload", JSON.stringify(payload));
+
+  const res = await fetch(`${base}/api/video/export`, {
+    method: "POST",
+    body: form,
+    signal: opts.signal,
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(parseErrorBody(text) || `HTTP ${res.status}`);
+  }
+  return res.blob();
 }

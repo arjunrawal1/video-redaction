@@ -8,6 +8,11 @@
 // output is structurally validated. Bboxes come back in 0..1000 normalized
 // coords and we convert to pixel-space Box via bboxToPixels.
 
+import {
+  type GoogleGenerativeAIProviderOptions,
+  createGoogleGenerativeAI,
+  google,
+} from "@ai-sdk/google";
 import { createOpenRouter } from "@openrouter/ai-sdk-provider";
 import { generateObject } from "ai";
 import { z } from "zod";
@@ -20,7 +25,7 @@ export type ServerBox = {
   text: string;
   score: number;
   label?: string;
-  origin?: "backtrack" | "forward";
+  origin?: "backtrack" | "forward" | "fix";
 };
 
 export type KnownLabel = {
@@ -61,7 +66,7 @@ const CompareItemSchema = z.object({
 
 let _provider: ReturnType<typeof createOpenRouter> | null = null;
 
-function getProvider(): ReturnType<typeof createOpenRouter> {
+export function getOpenRouter(): ReturnType<typeof createOpenRouter> {
   if (_provider) return _provider;
   const apiKey = process.env.OPENROUTER_API_KEY;
   if (!apiKey) {
@@ -73,13 +78,211 @@ function getProvider(): ReturnType<typeof createOpenRouter> {
   return _provider;
 }
 
+function getProvider(): ReturnType<typeof createOpenRouter> {
+  return getOpenRouter();
+}
+
 function modelSlug(): string {
   return process.env.OPENROUTER_MODEL || "google/gemini-2.5-flash";
+}
+
+// -- Google Gemini (agentic pipeline) -------------------------------------
+//
+// The agentic pipeline (curator + cascade + navigator) runs directly on
+// Google's Gemini API, not through OpenRouter. This is so we can access
+// Gemini-3-specific features that OpenRouter strips or doesn't expose:
+//   - `thinking_level` (vs. generic reasoning_effort)
+//   - `media_resolution_high` (explicit token budget per image — we need
+//     the full 1120-token-per-image budget for dense OCR work)
+//   - Code execution as a built-in tool — the model can write + run
+//     Python to zoom, crop, and annotate images when it needs to ground
+//     a small detail precisely.
+//   - Automatic Thought Signature handling across tool turns (strictly
+//     required for function-calling reasoning continuity).
+
+let _google: ReturnType<typeof createGoogleGenerativeAI> | null = null;
+
+export function getGoogleProvider(): ReturnType<typeof createGoogleGenerativeAI> {
+  if (_google) return _google;
+  const apiKey =
+    process.env.GOOGLE_GENERATIVE_AI_API_KEY ||
+    process.env.GEMINI_API_KEY ||
+    process.env.GOOGLE_API_KEY;
+  if (!apiKey) {
+    throw new Error(
+      "GOOGLE_GENERATIVE_AI_API_KEY missing. Add it to video-redaction-visualizer/.env.local.",
+    );
+  }
+  _google = createGoogleGenerativeAI({ apiKey });
+  return _google;
+}
+
+/**
+ * Model ID for every agentic-pipeline call (curator, cascade, navigator).
+ * Defaults to Gemini 3 Flash, which gives Pro-level reasoning at Flash
+ * pricing and supports both code execution and media-resolution control.
+ */
+export function agenticModelId(): string {
+  return process.env.AGENTIC_MODEL || "gemini-3-flash-preview";
+}
+
+/**
+ * Gemini 3 replaces the old `thinking_budget` token count with a
+ * qualitative `thinking_level`. For redaction work we want deep reasoning
+ * about partial-text visibility, so `high` (Gemini 3 Flash default) is a
+ * good fit. Override via AGENTIC_THINKING_LEVEL for faster runs.
+ */
+export function agenticThinkingLevel(): "minimal" | "low" | "medium" | "high" {
+  const raw = (process.env.AGENTIC_THINKING_LEVEL || "high").trim().toLowerCase();
+  if (raw === "minimal" || raw === "low" || raw === "medium" || raw === "high") {
+    return raw;
+  }
+  return "high";
+}
+
+/**
+ * Per-image token budget. Gemini 3 defaults to an optimal value based on
+ * media type, but for dense tabular-UI OCR the docs explicitly recommend
+ * `MEDIA_RESOLUTION_HIGH` (1120 tokens / image) to preserve small text
+ * legibility. Override if frames are unusually small or token cost is a
+ * concern.
+ */
+export function agenticMediaResolution():
+  | "MEDIA_RESOLUTION_LOW"
+  | "MEDIA_RESOLUTION_MEDIUM"
+  | "MEDIA_RESOLUTION_HIGH" {
+  const raw = (process.env.AGENTIC_MEDIA_RESOLUTION || "MEDIA_RESOLUTION_HIGH")
+    .trim()
+    .toUpperCase();
+  if (
+    raw === "MEDIA_RESOLUTION_LOW" ||
+    raw === "MEDIA_RESOLUTION_MEDIUM" ||
+    raw === "MEDIA_RESOLUTION_HIGH"
+  ) {
+    return raw;
+  }
+  return "MEDIA_RESOLUTION_HIGH";
+}
+
+/**
+ * When enabled, the cascade / navigator agents get Gemini's built-in
+ * `code_execution` tool — letting them write + run Python to crop, zoom,
+ * annotate, or measure images before placing a redaction box. Especially
+ * useful for tiny text or ambiguous edges. Curator runs don't get this
+ * (it's a pure structured-output task; code exec would just add latency).
+ *
+ * See: https://ai.google.dev/gemini-api/docs/gemini-3#code_execution_with_images
+ */
+export function agenticCodeExecutionEnabled(): boolean {
+  const raw = (process.env.AGENTIC_CODE_EXECUTION || "true").trim().toLowerCase();
+  return raw !== "false" && raw !== "0" && raw !== "off";
+}
+
+/**
+ * Returns the LanguageModelV3 for all agentic calls. Cached via
+ * `getGoogleProvider()`.
+ */
+export function agenticLanguageModel() {
+  return getGoogleProvider()(agenticModelId());
+}
+
+/**
+ * `providerOptions` object to spread into every agentic `generateText` /
+ * `generateObject` call. Sets thinking level and media resolution.
+ *
+ * NOTE: Gemini 3 docs strongly recommend leaving `temperature` at its
+ * default (1.0) — tuning it down can cause looping and degraded reasoning.
+ * So we do NOT set temperature on these calls.
+ */
+export function agenticProviderOptions() {
+  const google: GoogleGenerativeAIProviderOptions = {
+    thinkingConfig: { thinkingLevel: agenticThinkingLevel() },
+    mediaResolution: agenticMediaResolution(),
+  };
+  return { google } as const;
+}
+
+/**
+ * Built-in tools to spread alongside user-defined tools for agents that
+ * benefit from code execution (cascade + navigator). The tool name MUST
+ * be `code_execution` — Gemini rejects other keys.
+ */
+export function agenticBuiltinTools(): Record<string, ReturnType<typeof google.tools.codeExecution>> {
+  if (!agenticCodeExecutionEnabled()) return {};
+  return { code_execution: google.tools.codeExecution({}) };
+}
+
+/**
+ * Backward-compatible alias used by logging. Returns the model id instead
+ * of an OpenRouter slug now that we're on Google direct.
+ */
+export function agenticModelSlug(): string {
+  return agenticModelId();
 }
 
 export function openrouterConcurrency(): number {
   const raw = Number(process.env.OPENROUTER_CONCURRENCY || "4");
   return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 4;
+}
+
+export function agenticCuratorConcurrency(): number {
+  const raw = Number(process.env.AGENTIC_CURATOR_CONCURRENCY || "16");
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 16;
+}
+
+export function agenticNavigatorMaxSteps(): number {
+  const raw = Number(process.env.AGENTIC_NAVIGATOR_MAX_STEPS || "250");
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 250;
+}
+
+/**
+ * Switches the navigator architecture:
+ *   - "cascade" (default): one focused agent per phase-1 transition, each
+ *     cascading forward frame-by-frame until no more changes needed.
+ *   - "single": legacy free-roaming single-agent navigator (runNavigator).
+ */
+export function agenticNavMode(): "cascade" | "single" {
+  const raw = (process.env.AGENTIC_NAV_MODE || "cascade").trim().toLowerCase();
+  return raw === "single" ? "single" : "cascade";
+}
+
+/**
+ * How many focused agents run in parallel across transitions. The initial
+ * wave of transition agents is bounded by this; cascade children within
+ * each chain run sequentially after their parent finishes.
+ */
+export function agenticCascadeConcurrency(): number {
+  const raw = Number(process.env.AGENTIC_CASCADE_CONCURRENCY || "8");
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 8;
+}
+
+/**
+ * Max cascade chain length in a single direction from a seed anchor. A
+ * chain stops when the agent reports `still_visible=false`, runs into a
+ * frame already claimed by another chain in the same direction, reaches
+ * end of range, OR this depth ceiling is hit.
+ */
+export function agenticCascadeMaxDepth(): number {
+  const raw = Number(process.env.AGENTIC_CASCADE_MAX_DEPTH || "20");
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 20;
+}
+
+/**
+ * Total safety ceiling on how many focused agents a single navigate run
+ * can spawn across all chain seeds combined. Guards against runaway
+ * fan-out on pathological inputs. Bidirectional chains roughly double
+ * the seed count vs. forward-only, so this is set generously.
+ */
+export function agenticCascadeMaxAgents(): number {
+  const raw = Number(process.env.AGENTIC_CASCADE_MAX_AGENTS || "120");
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 120;
+}
+
+/** Per-focused-agent step ceiling (single focused agent is narrow, so this
+ * is smaller than the free-roaming navigator's cap). */
+export function agenticFocusedMaxSteps(): number {
+  const raw = Number(process.env.AGENTIC_FOCUSED_MAX_STEPS || "20");
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 20;
 }
 
 // -- Bbox conversion ------------------------------------------------------
@@ -89,7 +292,7 @@ export function openrouterConcurrency(): number {
  * Box {x, y, w, h} with the same ±2 px pad/clamp the OCR path applies so
  * overlays look consistent across engines.
  */
-function bboxToPixels(
+export function bboxToPixels(
   bbox: [number, number, number, number],
   frameW: number,
   frameH: number,
@@ -106,7 +309,7 @@ function bboxToPixels(
   return { x, y, w: Math.max(1, w), h: Math.max(1, h) };
 }
 
-function pixelBoxToNormalizedBbox(
+export function pixelBoxToNormalizedBbox(
   box: ServerBox,
   frameW: number,
   frameH: number,
@@ -127,14 +330,14 @@ function pixelBoxToNormalizedBbox(
 // don't re-describe it in prose.
 
 // Gemini's bbox training uses [y_min, x_min, y_max, x_max] normalized to
-// 0..1000. When the model is reached through OpenRouter's proxy the trained
-// schema association can drift (we've observed [x_min, y_min, ...] order in
-// practice), so we pin the order explicitly in the system prompt. This is
-// belt-and-suspenders with the `box_2d` schema name.
-const _BOX_FORMAT_NOTE =
+// 0..1000. We use this format everywhere — agentic pipeline tools,
+// prompts, structured outputs, and debug panels — so the model never has
+// to re-order / re-scale what it's seeing.
+export const BOX_FORMAT_NOTE =
   "Each `box_2d` is [y_min, x_min, y_max, x_max] in integer coordinates " +
   "normalized to 0..1000 on the image, where (0, 0) is the top-left corner " +
   "and (1000, 1000) is the bottom-right. y_min < y_max and x_min < x_max.";
+const _BOX_FORMAT_NOTE = BOX_FORMAT_NOTE;
 
 function phase1System(): string {
   return [

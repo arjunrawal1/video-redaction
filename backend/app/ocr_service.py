@@ -162,9 +162,17 @@ def _subspan_bbox(
     query_norm: str,
     frame_w: int,
     frame_h: int,
-) -> tuple[int, int, int, int] | None:
+) -> tuple[tuple[int, int, int, int], str] | None:
     """Find the tightest contiguous run of WORD children of `line_block` that
-    matches `query_norm`, and return its pixel bounding box.
+    matches `query_norm`, and return its pixel bounding box together with the
+    original-case text of just that span.
+
+    Returning both the rect and the subspan text lets the caller emit a Box
+    whose `text` field actually matches what the rectangle covers. Without
+    that, downstream consumers (curator LLM, "Copy OCR debug" UI) see the
+    full line text next to a box that only redacts part of it, which is
+    misleading and causes the curator to duplicate work (drop + re-add an
+    already-tight box).
 
     Strategy:
       1. Shortest contiguous subspan whose joined normalized text contains
@@ -229,11 +237,18 @@ def _subspan_bbox(
     if not any_box or xe <= xs or ye <= ys:
         return None
 
-    return _bbox_to_rect(
+    rect = _bbox_to_rect(
         {"Left": xs, "Top": ys, "Width": xe - xs, "Height": ye - ys},
         frame_w,
         frame_h,
     )
+    # Preserve original case / whitespace of the subspan for the emitted
+    # Box.text. Any missing word-text field defaults to "" so the join
+    # doesn't crash on odd Textract responses.
+    subspan_text = " ".join(
+        str(w.get("Text", "") or "") for w in words[lo : hi + 1]
+    ).strip()
+    return rect, subspan_text
 
 
 def _call_textract(blob: bytes) -> dict:
@@ -318,9 +333,18 @@ def _detect_frame(blob: bytes, query_norm: str) -> tuple[FrameDetections, dict]:
             continue
 
         rect: tuple[int, int, int, int] | None = None
+        emitted_text = text
         if target_type == "LINE":
-            rect = _subspan_bbox(b, block_by_id, query_norm, frame_w, frame_h)
-            if rect is not None:
+            sub = _subspan_bbox(b, block_by_id, query_norm, frame_w, frame_h)
+            if sub is not None:
+                rect, subspan_text = sub
+                # Override the LINE-level text with the subspan we actually
+                # redact. Keeps `Box.text` aligned with the rectangle so the
+                # curator LLM / UI debug panel see consistent labels. Fall
+                # back to the full line text if subspan text came back
+                # empty (belt-and-suspenders; shouldn't happen in practice).
+                if subspan_text:
+                    emitted_text = subspan_text
                 tightened += 1
         if rect is None:
             bbox = (b.get("Geometry") or {}).get("BoundingBox")
@@ -330,7 +354,7 @@ def _detect_frame(blob: bytes, query_norm: str) -> tuple[FrameDetections, dict]:
 
         x, y, bw, bh = rect
         matched.append(
-            Box(x=x, y=y, w=bw, h=bh, text=text, score=conf / 100.0)
+            Box(x=x, y=y, w=bw, h=bh, text=emitted_text, score=conf / 100.0)
         )
     t_match = time.perf_counter()
 
