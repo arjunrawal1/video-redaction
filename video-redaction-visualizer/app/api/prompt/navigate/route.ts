@@ -3,6 +3,7 @@ import {
   type NavHit,
   type NavigatorEvent,
 } from "@/lib/server/agentic-navigator";
+import { aerr, alog } from "@/lib/server/agentic-log";
 import { applyShrinkInPlace, shrinkBoxesOnFrame } from "@/lib/server/box-shrink";
 import { annotateFrame } from "@/lib/server/frame-annotate";
 import { fetchDeduplicatedFramesServer } from "@/lib/server/frames";
@@ -88,6 +89,16 @@ export async function POST(req: Request): Promise<Response> {
   });
 
   return ndjsonStreamResponse(async ({ emit, error }) => {
+    alog("prompt navigate route start", {
+      video_hash: framesRes.videoHash,
+      prompt: parsed.prompt,
+      predicate_hash: parsed.predicateHash,
+      frame_from: lo,
+      frame_to: hi,
+      total_frames: hi - lo + 1,
+      run_log_path: runLog.path,
+    });
+
     emit({
       type: "start",
       video_hash: framesRes.videoHash,
@@ -303,14 +314,22 @@ export async function POST(req: Request): Promise<Response> {
             frame_index: idx1,
             error: msg,
           });
+          aerr(`prompt navigate box shrink failed for idx=${idx1}`, e);
         }
       }
+      const shrinkElapsed = Date.now() - shrinkT0;
       runLog.write({
         kind: "box_shrink_summary",
         frames_processed: shrinkFramesProcessed,
         boxes_inspected: shrinkBoxesInspected,
         boxes_changed: shrinkBoxesChanged,
-        elapsed_ms: Date.now() - shrinkT0,
+        elapsed_ms: shrinkElapsed,
+      });
+      alog("prompt navigate route box_shrink done", {
+        frames_processed: shrinkFramesProcessed,
+        boxes_inspected: shrinkBoxesInspected,
+        boxes_changed: shrinkBoxesChanged,
+        elapsed_ms: shrinkElapsed,
       });
 
       // ---- Annotated-frame dump -------------------------------------
@@ -340,30 +359,42 @@ export async function POST(req: Request): Promise<Response> {
             runLog.writeFrame(`frame-${pad(idx1)}.jpg`, annotated);
             annotatedFrames += 1;
           } catch (e) {
-            console.warn(
-              `[prompt-navigate] annotated frame dump failed for idx=${idx1}:`,
-              e instanceof Error ? e.message : String(e),
-            );
+            aerr(`prompt navigate annotated frame dump failed for idx=${idx1}`, e);
           }
         }
+        const annotateElapsed = Date.now() - annotateT0;
         runLog.write({
           kind: "annotated_frames_written",
           frames_written: annotatedFrames,
           frames_dir: runLog.framesDir,
-          elapsed_ms: Date.now() - annotateT0,
+          elapsed_ms: annotateElapsed,
+        });
+        alog("prompt navigate route annotated frames written", {
+          frames_written: annotatedFrames,
+          frames_dir: runLog.framesDir,
+          elapsed_ms: annotateElapsed,
         });
       }
 
+      const totalElapsed = Date.now() - t0;
       runLog.write({
         kind: "run_end",
         status: "ok",
-        elapsed_ms: Date.now() - t0,
+        elapsed_ms: totalElapsed,
         added_boxes: result.added,
         removed_boxes: result.removed,
         total_steps: result.totalSteps,
         finish_summary: result.finishSummary,
       });
       await runLog.close();
+
+      alog("prompt navigate route done", {
+        elapsed_ms: totalElapsed,
+        added_boxes: result.added,
+        removed_boxes: result.removed,
+        total_steps: result.totalSteps,
+        finish_summary: result.finishSummary,
+      });
 
       emit({
         type: "done",
@@ -381,6 +412,7 @@ export async function POST(req: Request): Promise<Response> {
         error: msg,
       });
       await runLog.close();
+      aerr("prompt navigate route threw", e);
       error(`Prompt navigator failed: ${msg}`);
     }
   });

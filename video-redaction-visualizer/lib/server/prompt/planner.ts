@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { generateObject } from "ai";
 import sharp from "sharp";
 import { z } from "zod";
+import { aerr, alog } from "@/lib/server/agentic-log";
 import { extractRawOcrItems } from "@/lib/server/agentic-ocr";
 import { fetchDeduplicatedFramesServer } from "@/lib/server/frames";
 import { fetchOcrRaw } from "@/lib/server/ocr-client";
@@ -221,8 +222,20 @@ export async function buildSceneSummary(args: {
       total_dedup_frames: cached.total_dedup_frames,
       global_anchor_count: cached.global_anchors.length,
     });
+    alog("prompt scene summary cache hit", {
+      video_hash: framesRes.videoHash,
+      sample_frame_indices: cached.sample_frame_indices,
+      global_anchor_count: cached.global_anchors.length,
+    });
     return cached;
   }
+
+  const summaryT0 = Date.now();
+  alog("prompt scene summary building", {
+    video_hash: framesRes.videoHash,
+    sample_frame_indices: sampled,
+    total_dedup_frames: total,
+  });
 
   const ocrResults = await mapLimit(
     sampled,
@@ -304,6 +317,13 @@ export async function buildSceneSummary(args: {
     anchors_per_frame: compact(anchorsPerFrame),
     notes,
   });
+  alog("prompt scene summary built", {
+    elapsed_ms: Date.now() - summaryT0,
+    video_hash: framesRes.videoHash,
+    total_dedup_frames: total,
+    sample_frame_indices: sampled,
+    global_anchor_count: globalAnchors.length,
+  });
   return summary;
 }
 
@@ -311,12 +331,90 @@ const PlannerOutputSchema = z.object({
   predicate: z.any(),
 });
 
+// Gemini sometimes emits a leaf as `{ region: "<desc>", ... }` or
+// `{ semantic: "<desc>", ... }` instead of `{ kind: "region",
+// description: "<desc>", ... }`. Rescue those common shape mistakes
+// before falling back — the model's SEMANTIC output is correct, only
+// the field names are wrong.
+function coercePredicateShape(raw: unknown): unknown {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
+  const o = raw as Record<string, unknown>;
+  if (typeof o.kind === "string") {
+    if (o.kind === "and" || o.kind === "or") {
+      const children = Array.isArray(o.children) ? o.children : [];
+      return { ...o, children: children.map(coercePredicateShape) };
+    }
+    if (o.kind === "not") {
+      return { ...o, child: coercePredicateShape(o.child) };
+    }
+    return o;
+  }
+  // No `kind` — infer from which field was used.
+  if (typeof o.region === "string") {
+    return {
+      kind: "region",
+      description: o.region,
+      all_instances: typeof o.all_instances === "boolean" ? o.all_instances : true,
+      anchors: Array.isArray(o.anchors) ? o.anchors : undefined,
+      branch: typeof o.branch === "string" ? o.branch : undefined,
+      category: typeof o.category === "string" ? o.category : undefined,
+    };
+  }
+  if (typeof o.semantic === "string" || typeof o.description === "string") {
+    const description =
+      (typeof o.semantic === "string" && o.semantic) ||
+      (typeof o.description === "string" && o.description) ||
+      "";
+    // Disambiguate description-only leaves: region shapes tend to
+    // carry `all_instances` / `anchors`; semantic leaves don't.
+    const looksLikeRegion =
+      typeof o.all_instances === "boolean" || Array.isArray(o.anchors);
+    if (looksLikeRegion && typeof o.semantic !== "string") {
+      return {
+        kind: "region",
+        description,
+        all_instances: typeof o.all_instances === "boolean" ? o.all_instances : true,
+        anchors: Array.isArray(o.anchors) ? o.anchors : undefined,
+        branch: typeof o.branch === "string" ? o.branch : undefined,
+        category: typeof o.category === "string" ? o.category : undefined,
+      };
+    }
+    return {
+      kind: "semantic",
+      category: typeof o.category === "string" ? o.category : "user_content",
+      description,
+      examples: Array.isArray(o.examples) ? o.examples : undefined,
+      branch: typeof o.branch === "string" ? o.branch : undefined,
+    };
+  }
+  if (typeof o.text === "string") {
+    return {
+      kind: "text",
+      text: o.text,
+      fuzzy: typeof o.fuzzy === "boolean" ? o.fuzzy : true,
+      branch: typeof o.branch === "string" ? o.branch : undefined,
+      category: typeof o.category === "string" ? o.category : undefined,
+    };
+  }
+  return o;
+}
+
+// When the planner LLM fails or returns an unparseable shape we
+// intentionally do NOT synthesize a text leaf from the raw prompt —
+// that would reduce the prompt to naive substring matching against
+// OCR (any short OCR token that's a substring of the sentence would
+// light up, including column headers, bookmarks, dock icons, etc).
+// Instead, route the decision to a SEMANTIC leaf whose description
+// is the user's prompt verbatim. The curator / tools evaluate
+// semantic leaves by sending each OCR item to Gemini with the
+// description, so the model decides per-item whether it qualifies —
+// exactly the "Gemini reasoning does the work" contract we want.
 function fallbackPredicate(prompt: string): Predicate {
   const trimmed = prompt.trim();
   return {
-    kind: "text",
-    text: trimmed || "<UNRESOLVED>",
-    fuzzy: true,
+    kind: "semantic",
+    category: "user_prompt",
+    description: trimmed || "<UNRESOLVED>",
   };
 }
 
@@ -342,6 +440,13 @@ export async function parsePromptToPredicate(opts: {
       video_hash: opts.sceneSummary.video_hash,
       predicate: compact(cacheHit.predicate),
       predicate_hash: cacheHit.hash,
+    });
+    alog("prompt planner cache hit", {
+      prompt: opts.prompt,
+      video_hash: opts.sceneSummary.video_hash,
+      predicate_hash: cacheHit.hash,
+      predicate_kind:
+        (cacheHit.predicate as { kind?: string }).kind ?? "unknown",
     });
     return cacheHit;
   }
@@ -397,6 +502,12 @@ export async function parsePromptToPredicate(opts: {
     system_prompt: system,
     user_text: userText,
   });
+  alog("prompt planner request", {
+    model: agenticModelSlug(),
+    thinking_level: agenticThinkingLevel(),
+    prompt: opts.prompt,
+    sample_frame_indices: opts.sceneSummary.sample_frame_indices,
+  });
 
   const t0 = Date.now();
   let predicate: Predicate;
@@ -428,13 +539,15 @@ export async function parsePromptToPredicate(opts: {
     const parsed = response.object;
     const rawPredicate = parsed.predicate;
     if (rawPredicate && typeof rawPredicate === "object") {
+      const coerced = coercePredicateShape(rawPredicate);
       try {
-        predicate = PredicateSchema.parse(rawPredicate);
+        predicate = PredicateSchema.parse(coerced);
       } catch (e) {
         runLog?.write({
           kind: "planner_schema_error",
           error: e instanceof Error ? e.message : String(e),
           raw_predicate: compact(rawPredicate),
+          coerced_predicate: compact(coerced),
         });
         predicate = fallbackPredicate(opts.prompt);
         usedFallback = true;
@@ -456,6 +569,12 @@ export async function parsePromptToPredicate(opts: {
       predicate: compact(predicate),
       raw_parsed: compact(parsed),
     });
+    alog(`prompt planner response (${Date.now() - t0}ms)`, {
+      finish_reason: response.finishReason,
+      used_fallback: usedFallback,
+      predicate_kind: (predicate as { kind?: string }).kind ?? "unknown",
+      usage: response.usage,
+    });
   } catch (e) {
     predicate = assignBranchIds(fallbackPredicate(opts.prompt));
     usedFallback = true;
@@ -465,6 +584,7 @@ export async function parsePromptToPredicate(opts: {
       error: e instanceof Error ? e.message : String(e),
       fallback_predicate: compact(predicate),
     });
+    aerr("prompt planner generateObject failed", e);
   }
 
   const hash = hashPredicate(predicate);

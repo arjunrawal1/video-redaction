@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { generateText, stepCountIs, type LanguageModelUsage } from "ai";
+import { aerr, alog } from "@/lib/server/agentic-log";
 import { extractRawOcrItems } from "@/lib/server/agentic-ocr";
 import {
   agenticLanguageModel,
@@ -144,6 +145,24 @@ function singleTextLeaf(predicate: Predicate): Extract<ReturnType<typeof collect
   if (leaves.length !== 1) return null;
   const [leaf] = leaves;
   return leaf.kind === "text" ? leaf : null;
+}
+
+// Gate for the text fastpath. The fastpath keeps every OCR candidate
+// whose text substring-matches the leaf's text — that's safe when the
+// leaf is a tight literal the planner extracted (e.g. "John Smith",
+// "acme-corp-holdings"), but catastrophic when the leaf accidentally
+// holds a whole-sentence prompt (see `lib/server/prompt/resolver.ts`:
+// `needle.includes(textNorm)` turns every short OCR token into an
+// exact match). Refuse anything that looks like prose so the path
+// cannot be abused.
+function isFastpathSafeLiteral(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) return false;
+  if (trimmed.length > 48) return false;
+  const words = trimmed.split(/\s+/);
+  if (words.length > 6) return false;
+  if (/[.?!;:]/.test(trimmed)) return false;
+  return true;
 }
 
 async function deterministicFallback(args: {
@@ -296,7 +315,12 @@ export async function curateFramePrompt(args: {
 }): Promise<CuratorResult> {
   const runLog = args.runLog ?? null;
   const leaf = singleTextLeaf(args.predicate);
-  if (leaf && leaf.fuzzy && PROMPT_CURATOR_TEXT_FASTPATH) {
+  if (
+    leaf &&
+    leaf.fuzzy &&
+    PROMPT_CURATOR_TEXT_FASTPATH &&
+    isFastpathSafeLiteral(leaf.text)
+  ) {
     const rawItems = extractRawOcrItems(args.rawOcr);
     const kept = args.textCandidates.map((c) => {
       const text = rawItems[c.ocr_index]?.text ?? c.text;
@@ -319,6 +343,12 @@ export async function curateFramePrompt(args: {
       fuzzy: leaf.fuzzy,
       kept_count: kept.length,
       kept_texts: kept.map((b) => b.text),
+    });
+    alog(`prompt curator frame #${args.frameIndex} fastpath`, {
+      branch: leaf.branch ?? "L0",
+      text: leaf.text,
+      fuzzy: leaf.fuzzy,
+      kept_count: kept.length,
     });
     return {
       kept,
@@ -372,6 +402,14 @@ export async function curateFramePrompt(args: {
     system_prompt: systemPrompt,
     user_text: userText,
   });
+  alog(`prompt curator frame #${args.frameIndex} request`, {
+    model: agenticModelSlug(),
+    thinking_level: agenticThinkingLevel(),
+    region_count: args.regions.length,
+    text_candidate_count: args.textCandidates.length,
+    jpeg_bytes: args.jpeg.byteLength,
+    max_steps: PROMPT_CURATOR_MAX_STEPS,
+  });
 
   let usage: LanguageModelUsage | null = null;
   let raw: unknown = null;
@@ -412,14 +450,16 @@ export async function curateFramePrompt(args: {
       elapsed_ms: Date.now() - t0,
       error: generateError,
     });
+    aerr(`prompt curator frame #${args.frameIndex} generateText failed`, e);
   }
 
   const mutation = runtime.getMutation();
+  const elapsed = Date.now() - t0;
 
   runLog?.write({
     kind: "curator_response",
     frame_index: args.frameIndex,
-    elapsed_ms: Date.now() - t0,
+    elapsed_ms: elapsed,
     finish_reason: finishReason,
     warnings: warnings,
     usage,
@@ -431,6 +471,14 @@ export async function curateFramePrompt(args: {
     dropped_count: mutation.dropped.length,
     kept_texts: mutation.kept.map((b) => b.text),
     added_texts: mutation.added.map((b) => b.text),
+  });
+  alog(`prompt curator frame #${args.frameIndex} response (${elapsed}ms)`, {
+    finish_reason: finishReason,
+    kept_count: mutation.kept.length,
+    added_count: mutation.added.length,
+    dropped_count: mutation.dropped.length,
+    tool_finish_summary: mutation.finish_summary,
+    usage,
   });
 
   let kept = mutation.kept;
@@ -511,6 +559,13 @@ export async function curateFramePrompt(args: {
   runLog?.write({
     kind: "curator_resolved",
     frame_index: args.frameIndex,
+    used_deterministic_fallback: usedDeterministicFallback,
+    kept_count: kept.length,
+    added_count: added.length,
+    dropped_count: dropped.length,
+    instance_count: instances.length,
+  });
+  alog(`prompt curator frame #${args.frameIndex} resolved`, {
     used_deterministic_fallback: usedDeterministicFallback,
     kept_count: kept.length,
     added_count: added.length,

@@ -1,8 +1,20 @@
+import {
+  linkFramePair,
+  type LinkDecision,
+} from "@/lib/server/agentic-linker";
+import { aerr, alog } from "@/lib/server/agentic-log";
 import { annotateFrame } from "@/lib/server/frame-annotate";
 import { applyShrinkInPlace, shrinkBoxesOnFrame } from "@/lib/server/box-shrink";
+import { addUsage, emptyUsage, geminiCost } from "@/lib/server/cost";
 import { createEntry, putFrame, type FrameState } from "@/lib/server/gemini-cache";
 import { fetchDeduplicatedFramesServer } from "@/lib/server/frames";
+import { linkFramePairFallback } from "@/lib/server/linker-fallback";
 import { fetchOcrRaw } from "@/lib/server/ocr-client";
+import {
+  agenticLinkerConcurrency,
+  agenticLinkerModelId,
+  type ServerBox,
+} from "@/lib/server/openrouter";
 import { curateFramePrompt } from "@/lib/server/prompt/curator";
 import { precomputeFrame } from "@/lib/server/prompt/resolver";
 import { hasUnresolvedPredicate } from "@/lib/server/prompt/types";
@@ -121,9 +133,22 @@ export async function POST(req: Request): Promise<Response> {
     dedup_threshold: dedupThreshold,
     max_gap: maxGap,
     ocr_frames_returned: ocr.frames.length,
+    model_linker: agenticLinkerModelId(),
   });
 
   return ndjsonStreamResponse(async ({ emit, error }) => {
+    alog("prompt detect route start", {
+      video_hash: framesRes.videoHash,
+      prompt,
+      predicate_hash: predicateHash,
+      frame_from: lo,
+      frame_to: hi,
+      total_frames: indices.length,
+      ocr_frames_returned: ocr.frames.length,
+      concurrency: PROMPT_DETECT_CONCURRENCY,
+      run_log_path: runLog.path,
+    });
+
     emit({
       type: "start",
       video_hash: framesRes.videoHash,
@@ -244,6 +269,7 @@ export async function POST(req: Request): Promise<Response> {
             frame_index: idx1,
             error: msg,
           });
+          aerr(`prompt detect frame #${idx1} failed`, e);
           error(`Prompt detect failed on frame ${idx1}: ${msg}`);
           putFrame(entry, idx1, {
             width: src.width,
@@ -332,14 +358,280 @@ export async function POST(req: Request): Promise<Response> {
           frame_index: idx1,
           error: msg,
         });
+        aerr(`prompt detect box shrink failed for idx=${idx1}`, e);
       }
     }
+    const shrinkElapsed = Date.now() - shrinkT0;
     runLog.write({
       kind: "box_shrink_summary",
       frames_processed: shrinkFramesProcessed,
       boxes_inspected: shrinkBoxesInspected,
       boxes_changed: shrinkBoxesChanged,
-      elapsed_ms: Date.now() - shrinkT0,
+      elapsed_ms: shrinkElapsed,
+    });
+    alog("prompt detect route box_shrink done", {
+      frames_processed: shrinkFramesProcessed,
+      boxes_inspected: shrinkBoxesInspected,
+      boxes_changed: shrinkBoxesChanged,
+      elapsed_ms: shrinkElapsed,
+    });
+
+    // ---- Phase 1.5: linker ------------------------------------------
+    // Same three-phase design as the teamwork detect route: plan →
+    // parallel Gemini calls → serial stitch. Prompt-mode boxes already
+    // carry a deterministic `instance_id` (branch + normalized text /
+    // semantic hash / region sub-id), and the `frame` events emit
+    // `track_id = instance_id` by default so same-text redactions
+    // across frames already tween. The linker supplements that: for
+    // region-mode predicates where sub-ids aren't stable, and for
+    // scroll/resize cases where the LLM's visual judgment beats
+    // textual identity, it stamps a model-derived `track_id` which
+    // the client `link` handler then overwrites onto the boxes.
+    const linkerT0 = Date.now();
+    const linkerUsage = emptyUsage();
+    let linkerCalls = 0;
+    let linkerFallbacks = 0;
+    let nextTrackId = 0;
+    const mintTrack = (): string => `t${nextTrackId++}`;
+
+    type PairJob = {
+      bIdx: number;
+      jpegA: Uint8Array;
+      jpegB: Uint8Array;
+      frameIndexA: number;
+      frameIndexB: number;
+      frameWidthA: number;
+      frameHeightA: number;
+      frameWidthB: number;
+      frameHeightB: number;
+      boxesA: ServerBox[];
+      boxesB: ServerBox[];
+    };
+    type PlanEntry =
+      | { kind: "gap"; idx: number }
+      | { kind: "empty"; idx: number }
+      | { kind: "start"; idx: number; boxes: ServerBox[] }
+      | { kind: "link"; idx: number; boxes: ServerBox[]; pair: PairJob };
+
+    const plan: PlanEntry[] = [];
+    const pairJobs: PairJob[] = [];
+    {
+      type PlanPrev = {
+        index: number;
+        boxes: ServerBox[];
+        jpeg: Uint8Array;
+        width: number;
+        height: number;
+      };
+      let planPrev: PlanPrev | null = null;
+      for (const idx1 of indices) {
+        const state = entry.perFrame[idx1];
+        if (!state) {
+          plan.push({ kind: "gap", idx: idx1 });
+          planPrev = null;
+          continue;
+        }
+        const boxes = state.matched;
+        if (boxes.length === 0) {
+          plan.push({ kind: "empty", idx: idx1 });
+          planPrev = null;
+          continue;
+        }
+        if (!planPrev) {
+          plan.push({ kind: "start", idx: idx1, boxes });
+        } else {
+          const job: PairJob = {
+            bIdx: idx1,
+            jpegA: planPrev.jpeg,
+            jpegB: state.blob,
+            frameIndexA: planPrev.index,
+            frameIndexB: idx1,
+            frameWidthA: planPrev.width,
+            frameHeightA: planPrev.height,
+            frameWidthB: state.width,
+            frameHeightB: state.height,
+            boxesA: planPrev.boxes,
+            boxesB: boxes,
+          };
+          pairJobs.push(job);
+          plan.push({ kind: "link", idx: idx1, boxes, pair: job });
+        }
+        planPrev = {
+          index: idx1,
+          boxes,
+          jpeg: state.blob,
+          width: state.width,
+          height: state.height,
+        };
+      }
+    }
+
+    const decisionsByBIdx = new Map<number, LinkDecision[]>();
+    const fallbackByBIdx = new Set<number>();
+    const linkerConcurrency = Math.max(1, agenticLinkerConcurrency());
+    let pairCursor = 0;
+    const linkerWorker = async (): Promise<void> => {
+      while (true) {
+        const my = pairCursor++;
+        if (my >= pairJobs.length) return;
+        const job = pairJobs[my];
+        try {
+          const r = await linkFramePair({
+            jpegA: job.jpegA,
+            jpegB: job.jpegB,
+            frameIndexA: job.frameIndexA,
+            frameIndexB: job.frameIndexB,
+            frameWidthA: job.frameWidthA,
+            frameHeightA: job.frameHeightA,
+            frameWidthB: job.frameWidthB,
+            frameHeightB: job.frameHeightB,
+            boxesA: job.boxesA,
+            boxesB: job.boxesB,
+            runLog,
+          });
+          decisionsByBIdx.set(job.bIdx, r.links);
+          addUsage(linkerUsage, r.usage);
+          if (r.usage != null) linkerCalls += 1;
+        } catch (e) {
+          aerr(
+            `linker pair #${job.frameIndexA}→#${job.frameIndexB} fell back`,
+            e,
+          );
+          decisionsByBIdx.set(
+            job.bIdx,
+            linkFramePairFallback({
+              boxesA: job.boxesA,
+              boxesB: job.boxesB,
+              frameWidthA: job.frameWidthA,
+              frameHeightA: job.frameHeightA,
+              frameWidthB: job.frameWidthB,
+              frameHeightB: job.frameHeightB,
+            }),
+          );
+          fallbackByBIdx.add(job.bIdx);
+          linkerFallbacks += 1;
+          error(
+            `Linker failed on #${job.frameIndexA}→#${job.frameIndexB}, used fallback: ` +
+              (e instanceof Error ? e.message : String(e)),
+          );
+        }
+      }
+    };
+    await Promise.all(
+      Array.from(
+        { length: Math.min(linkerConcurrency, pairJobs.length) },
+        () => linkerWorker(),
+      ),
+    );
+
+    let prevTrackIds: string[] | null = null;
+    let prevIndex: number | null = null;
+    for (const pe of plan) {
+      if (pe.kind === "gap") {
+        prevTrackIds = null;
+        prevIndex = null;
+        continue;
+      }
+      if (pe.kind === "empty") {
+        emit({
+          type: "link",
+          index: pe.idx,
+          track_ids: [],
+          links: [],
+        });
+        prevTrackIds = null;
+        prevIndex = null;
+        continue;
+      }
+
+      const boxes = pe.boxes;
+      let decisions: LinkDecision[];
+      let fallback = false;
+      if (pe.kind === "start") {
+        decisions = boxes.map((_, bi) => ({
+          b_index: bi,
+          a_index: null,
+          reason: "chain start",
+        }));
+      } else {
+        decisions =
+          decisionsByBIdx.get(pe.idx) ??
+          linkFramePairFallback({
+            boxesA: pe.pair.boxesA,
+            boxesB: pe.pair.boxesB,
+            frameWidthA: pe.pair.frameWidthA,
+            frameHeightA: pe.pair.frameHeightA,
+            frameWidthB: pe.pair.frameWidthB,
+            frameHeightB: pe.pair.frameHeightB,
+          });
+        fallback = fallbackByBIdx.has(pe.idx);
+      }
+
+      const trackIds: string[] = new Array(boxes.length);
+      const linkNarrative: Array<{
+        prev_index: number | null;
+        prev_b_index: number | null;
+        reason: string | null;
+        fallback?: boolean;
+      }> = new Array(boxes.length);
+      for (let bi = 0; bi < boxes.length; bi++) {
+        const d = decisions[bi] ?? {
+          b_index: bi,
+          a_index: null,
+          reason: null,
+        };
+        let id: string;
+        let prevBIndex: number | null = null;
+        if (
+          prevTrackIds &&
+          d.a_index != null &&
+          d.a_index < prevTrackIds.length
+        ) {
+          id = prevTrackIds[d.a_index];
+          prevBIndex = d.a_index;
+        } else {
+          id = mintTrack();
+        }
+        trackIds[bi] = id;
+        boxes[bi].track_id = id;
+        linkNarrative[bi] = {
+          prev_index: prevIndex,
+          prev_b_index: prevBIndex,
+          reason: d.reason,
+          ...(fallback ? { fallback: true } : {}),
+        };
+      }
+
+      emit({
+        type: "link",
+        index: pe.idx,
+        track_ids: trackIds,
+        links: linkNarrative,
+      });
+
+      prevTrackIds = trackIds;
+      prevIndex = pe.idx;
+    }
+
+    const linkerElapsed = Date.now() - linkerT0;
+    const linkerBill = geminiCost(agenticLinkerModelId(), linkerUsage);
+    runLog.write({
+      kind: "linker_summary",
+      linker_model: linkerBill.model,
+      linker_calls: linkerCalls,
+      linker_fallbacks: linkerFallbacks,
+      linker_input_tokens: linkerBill.inputTokens,
+      linker_output_tokens: linkerBill.outputTokens,
+      linker_reasoning_tokens: linkerBill.reasoningTokens,
+      linker_cached_input_tokens: linkerBill.cachedInputTokens,
+      linker_total_usd: linkerBill.totalUSD,
+      elapsed_ms: linkerElapsed,
+    });
+    alog("prompt detect route linker done", {
+      linker_calls: linkerCalls,
+      linker_fallbacks: linkerFallbacks,
+      linker_total_usd: linkerBill.totalUSD,
+      elapsed_ms: linkerElapsed,
     });
 
     // ---- Annotated-frame dump ----------------------------------------
@@ -370,17 +662,20 @@ export async function POST(req: Request): Promise<Response> {
           runLog.writeFrame(`frame-${pad(idx1)}.jpg`, annotated);
           annotatedFrames += 1;
         } catch (e) {
-          console.warn(
-            `[prompt-detect] annotated frame dump failed for idx=${idx1}:`,
-            e instanceof Error ? e.message : String(e),
-          );
+          aerr(`prompt detect annotated frame dump failed for idx=${idx1}`, e);
         }
       }
+      const annotateElapsed = Date.now() - annotateT0;
       runLog.write({
         kind: "annotated_frames_written",
         frames_written: annotatedFrames,
         frames_dir: runLog.framesDir,
-        elapsed_ms: Date.now() - annotateT0,
+        elapsed_ms: annotateElapsed,
+      });
+      alog("prompt detect route annotated frames written", {
+        frames_written: annotatedFrames,
+        frames_dir: runLog.framesDir,
+        elapsed_ms: annotateElapsed,
       });
     }
 
@@ -390,8 +685,21 @@ export async function POST(req: Request): Promise<Response> {
       elapsed_ms: elapsed,
       matched_frames: matchedFrames,
       total_boxes: totalBoxes,
+      linker_elapsed_ms: linkerElapsed,
+      linker_calls: linkerCalls,
+      linker_fallbacks: linkerFallbacks,
+      linker_total_usd: linkerBill.totalUSD,
     });
     await runLog.close();
+
+    alog("prompt detect route done", {
+      elapsed_ms: elapsed,
+      matched_frames: matchedFrames,
+      total_boxes: totalBoxes,
+      frames_processed: indices.length,
+      linker_calls: linkerCalls,
+      linker_fallbacks: linkerFallbacks,
+    });
 
     emit({
       type: "done",

@@ -1,4 +1,5 @@
 import { agenticCascadeMaxAgents, agenticCascadeMaxDepth } from "@/lib/server/openrouter";
+import { alog } from "@/lib/server/agentic-log";
 import type { NavFrameState, NavHit, NavigatorEvent } from "@/lib/server/agentic-navigator";
 import { compact, type RunLog } from "@/lib/server/run-log";
 import { filterOcr } from "./tools";
@@ -272,6 +273,12 @@ export async function runPromptCascade(args: {
     max_depth: PROMPT_CASCADE_MAX_DEPTH,
     predicate: compact(args.predicate),
   });
+  alog("prompt cascade plan", {
+    frame_count: args.frames.length,
+    seed_count: seeds.length,
+    max_agents: PROMPT_CASCADE_MAX_AGENTS,
+    max_depth: PROMPT_CASCADE_MAX_DEPTH,
+  });
   let added = 0;
   const removed = 0;
   let totalSteps = 0;
@@ -287,6 +294,10 @@ export async function runPromptCascade(args: {
         agents,
         max_agents: PROMPT_CASCADE_MAX_AGENTS,
       });
+      alog("prompt cascade max agents reached", {
+        agents,
+        max_agents: PROMPT_CASCADE_MAX_AGENTS,
+      });
       break;
     }
     const agentId = `prompt-${seed.direction}-${seed.instance_id}-${seed.first_focus}`;
@@ -295,6 +306,13 @@ export async function runPromptCascade(args: {
     runLog?.write({
       kind: "cascade_agent_start",
       agent_id: agentId,
+      instance_id: seed.instance_id,
+      direction: seed.direction,
+      first_focus: seed.first_focus,
+      source_frame: seed.source_frame,
+      source_text: seed.source_hit.text,
+    });
+    alog(`[${agentId}] start`, {
       instance_id: seed.instance_id,
       direction: seed.direction,
       first_focus: seed.first_focus,
@@ -386,6 +404,12 @@ export async function runPromptCascade(args: {
       added: stepAdded,
       total_steps_in_chain: Math.max(1, depth),
     });
+    alog(`[${agentId}] end`, {
+      instance_id: seed.instance_id,
+      direction: seed.direction,
+      added: stepAdded,
+      total_steps_in_chain: Math.max(1, depth),
+    });
     args.onEvent({
       type: "agent_end",
       agent_id: agentId,
@@ -405,6 +429,13 @@ export async function runPromptCascade(args: {
 
   runLog?.write({
     kind: "cascade_finish",
+    added,
+    removed,
+    total_steps: totalSteps,
+    agents,
+    summary: finishSummary,
+  });
+  alog("prompt cascade finish", {
     added,
     removed,
     total_steps: totalSteps,

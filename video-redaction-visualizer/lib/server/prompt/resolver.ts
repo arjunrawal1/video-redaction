@@ -1,5 +1,6 @@
 import { generateObject } from "ai";
 import { z } from "zod";
+import { aerr, alog } from "@/lib/server/agentic-log";
 import { extractRawOcrItems } from "@/lib/server/agentic-ocr";
 import {
   agenticLanguageModel,
@@ -173,6 +174,12 @@ async function localizeRegionLive(args: {
     system_prompt: system,
     user_text: userText,
   });
+  alog(`prompt region #${args.frameIndex} request`, {
+    branch: args.leaf.branch ?? "L0",
+    description: args.leaf.description,
+    all_instances: args.leaf.all_instances,
+    anchors: args.leaf.anchors ?? [],
+  });
 
   const t0 = Date.now();
   try {
@@ -203,16 +210,22 @@ async function localizeRegionLive(args: {
       reason: r.reason,
     }));
 
+    const elapsed = Date.now() - t0;
     args.runLog?.write({
       kind: "region_response",
       frame_index: args.frameIndex,
       branch: args.leaf.branch ?? "L0",
-      elapsed_ms: Date.now() - t0,
+      elapsed_ms: elapsed,
       finish_reason: result.finishReason,
       warnings: result.warnings,
       usage: result.usage,
       regions: compact(regions),
       regions_returned: regions.length,
+    });
+    alog(`prompt region #${args.frameIndex} response (${elapsed}ms)`, {
+      branch: args.leaf.branch ?? "L0",
+      regions_returned: regions.length,
+      finish_reason: result.finishReason,
     });
 
     if (regions.length > 0) return regions;
@@ -220,6 +233,10 @@ async function localizeRegionLive(args: {
     args.runLog?.write({
       kind: "region_fallback_fullframe",
       frame_index: args.frameIndex,
+      branch: args.leaf.branch ?? "L0",
+      reason: "model returned zero regions",
+    });
+    alog(`prompt region #${args.frameIndex} fallback full-frame`, {
       branch: args.leaf.branch ?? "L0",
       reason: "model returned zero regions",
     });
@@ -231,6 +248,7 @@ async function localizeRegionLive(args: {
       elapsed_ms: Date.now() - t0,
       error: e instanceof Error ? e.message : String(e),
     });
+    aerr(`prompt region #${args.frameIndex} generateObject failed`, e);
     args.runLog?.write({
       kind: "region_fallback_fullframe",
       frame_index: args.frameIndex,

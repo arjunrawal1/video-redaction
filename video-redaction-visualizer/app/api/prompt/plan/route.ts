@@ -1,3 +1,4 @@
+import { aerr, alog } from "@/lib/server/agentic-log";
 import { buildSceneSummary, parsePromptToPredicate } from "@/lib/server/prompt/planner";
 import {
   createPlanSession,
@@ -35,6 +36,15 @@ export async function POST(req: Request): Promise<Response> {
     max_gap: parsed.maxGap,
   });
 
+  alog("prompt plan route start", {
+    prompt: parsed.prompt,
+    frame_from: parsed.frameFrom,
+    frame_to: parsed.frameTo,
+    fps: parsed.fps,
+    run_log_path: runLog.path,
+  });
+
+  const t0 = Date.now();
   try {
     const summary = await buildSceneSummary({
       file: parsed.file,
@@ -66,6 +76,13 @@ export async function POST(req: Request): Promise<Response> {
       predicate_hash: planned.hash,
     });
     await runLog.close();
+    alog("prompt plan route done", {
+      elapsed_ms: Date.now() - t0,
+      session_id: session.session_id,
+      predicate_hash: planned.hash,
+      predicate_kind:
+        (planned.predicate as { kind?: string }).kind ?? "unknown",
+    });
     return jsonBody({
       ...toPublicPlanSession(session),
       run_log_path: runLog.path,
@@ -77,6 +94,7 @@ export async function POST(req: Request): Promise<Response> {
       error: e instanceof Error ? e.message : String(e),
     });
     await runLog.close();
+    aerr("prompt plan route threw", e);
     return jsonBody(
       {
         detail:
